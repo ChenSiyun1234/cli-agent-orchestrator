@@ -163,6 +163,21 @@ PLAN_APPROVAL_PATTERN = r"Would you like to proceed\?"
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
 _DIALOG_BOTTOM_LINES = 15
+# Claude's account-quota banner is actionable only while it is visible at the
+# bottom of the active viewport. The first pattern deliberately requires the
+# second-person banner wording, rather than generic rate/error/limit tokens;
+# the second requires explicit reset language in the same small banner block.
+_QUOTA_BOTTOM_LINES = 15
+_ACCOUNT_LIMIT_BANNER_PATTERN = re.compile(
+    r"^[ \t│┃┆┇┊┋╭╰┌└┤├▐▌⚠!⎿●]*"
+    r"you(?:['’]ve| have)[ \t]+(?:hit|reached)[ \t]+your[ \t]+"
+    r"(?:(?:account|usage|monthly[ \t]+spend)[ \t]+)?limit\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_QUOTA_RESET_PATTERN = re.compile(
+    r"\b(?:resets|will[ \t]+reset|reset[ \t]+(?:at|in|on))\b",
+    re.IGNORECASE,
+)
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 # New Claude Code TUI completion summary, e.g. "✻ Sautéed for 1s" /
 # "✶ Cultivated for 12s". Unlike the active spinner (PROCESSING_PATTERN, which
@@ -260,6 +275,35 @@ NEW_TUI_SPINNER_PATTERN = r"[✶✢✽✻✳·*][^\n]*ing…"
 NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*ing\b.*…")
 
 
+def _has_account_quota_banner(output: str) -> bool:
+    """Return whether the live bottom viewport contains Claude's quota banner.
+
+    Fenced examples are blanked before selecting the viewport so quoted logs or
+    agent-authored Markdown cannot become runtime quota evidence. Reset wording
+    must occur on the account-limit line or one of its next two banner lines.
+    """
+
+    visible_lines: List[str] = []
+    in_fence = False
+    for line in output.splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+            visible_lines.append("")
+        elif in_fence:
+            visible_lines.append("")
+        else:
+            visible_lines.append(line)
+
+    bottom = visible_lines[-_QUOTA_BOTTOM_LINES:]
+    for index, line in enumerate(bottom):
+        if not _ACCOUNT_LIMIT_BANNER_PATTERN.search(line):
+            continue
+        banner_block = "\n".join(bottom[index : index + 3])
+        if _EXPLICIT_QUOTA_RESET_PATTERN.search(banner_block):
+            return True
+    return False
+
+
 class ClaudeCodeProvider(BaseProvider):
     """Provider for Claude Code CLI tool integration."""
 
@@ -291,7 +335,29 @@ class ClaudeCodeProvider(BaseProvider):
         self._snapshot_tail_hash: Optional[str] = None
         self._snapshot_last_response: Optional[str] = None
         self._snapshot_response_count: int = 0
+        self._snapshot_had_quota_banner = False
         self._input_snapshot_prepared = False
+        self._quota_latched = False
+
+    @property
+    def step_error_kind(self) -> str:
+        """Expose quota only after the active-banner detector latched it."""
+
+        return "quota" if self._quota_latched else "error"
+
+    def _latch_active_quota_banner(self, output: str) -> bool:
+        """Latch a newly visible post-dispatch account-quota banner."""
+
+        if (
+            not self._task_dispatched
+            or self._input_generation <= 0
+            or self._snapshot_had_quota_banner
+        ):
+            return False
+        if not _has_account_quota_banner(output):
+            return False
+        self._quota_latched = True
+        return True
 
     @staticmethod
     def _tail_hash(output: str, n: int = 30) -> str:
@@ -874,6 +940,12 @@ class ClaudeCodeProvider(BaseProvider):
             if current_hash == self._snapshot_tail_hash:
                 return TerminalStatus.PROCESSING
 
+        # A quota is not inferred from HTTP/status words. It is latched only
+        # from Claude's newly visible account-limit banner, after a successful
+        # CAO dispatch and after the unchanged pre-send snapshot is excluded.
+        if self._latch_active_quota_banner(output):
+            return TerminalStatus.ERROR
+
         # PRIMARY PROCESSING check: walk backwards from the *last* separator.
         _sep_re = re.compile(r"(?:\x1b\[[0-9;]*m)*\u2500{20,}")
         _sep_positions = [m.start() for m in _sep_re.finditer(output)]
@@ -1117,7 +1189,11 @@ class ClaudeCodeProvider(BaseProvider):
         otherwise read as an idle prompt and declare the terminal ready before
         Claude's TUI has even rendered, breaking init (observed live).
         """
-        rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
+        viewport = [ln.rstrip() for ln in screen_lines]
+        if self._latch_active_quota_banner("\n".join(viewport)):
+            return TerminalStatus.ERROR
+
+        rows = [ln for ln in viewport if ln.strip()]
         if not rows:
             return TerminalStatus.UNKNOWN
         joined = "\n".join(rows)
@@ -1326,6 +1402,7 @@ class ClaudeCodeProvider(BaseProvider):
         output = get_backend().get_history(self.session_name, self.window_name) or ""
         self._snapshot_tail_hash = self._tail_hash(output, self._TAIL_HASH_LINES)
         self._snapshot_last_response = self._extract_last_response_text(output)
+        self._snapshot_had_quota_banner = _has_account_quota_banner(strip_terminal_escapes(output))
         clean = self._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
         self._snapshot_response_count = len(list(re.finditer(r"[⏺●]\s+", clean)))
 
@@ -1347,6 +1424,7 @@ class ClaudeCodeProvider(BaseProvider):
         if not self._input_snapshot_prepared:
             self._capture_input_snapshot()
         self._input_snapshot_prepared = False
+        self._quota_latched = False
         self._input_generation += 1
         super().mark_input_received()
 
@@ -1432,6 +1510,8 @@ class ClaudeCodeProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Claude Code provider."""
         self._initialized = False
+        self._quota_latched = False
+        self._snapshot_had_quota_banner = False
         # Remove temp files created during initialization
         tmp_dir = CAO_HOME_DIR / "tmp"
         for suffix in (".prompt", ".mcp.json"):

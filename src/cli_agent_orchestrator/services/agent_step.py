@@ -153,9 +153,9 @@ class StepExecutionError(Exception):
 
     Carries two structured fields so callers never have to scrape the message:
 
-    - ``kind`` distinguishes a worker that *ran long* (``"timeout"``) from one
-      that *crashed* (``"error"``, i.e. the terminal reached ERROR). The two
-      were previously indistinguishable — both surfaced as a 504 "timed out".
+    - ``kind`` distinguishes a worker that *ran long* (``"timeout"``), one
+      that *crashed* (``"error"``), and a provider-authenticated account quota
+      (``"quota"``). Generic provider/rate-limit text remains ``"error"``.
     - ``terminal_id`` is the live terminal the step ran on (when known), so a
       failed caller can report/clean it up without regex-scraping the message.
     """
@@ -170,6 +170,23 @@ class StepExecutionError(Exception):
         super().__init__(message)
         self.kind = kind
         self.terminal_id = terminal_id
+
+
+def _terminal_error_kind(terminal_id: str) -> str:
+    """Read a provider-authenticated error kind, defaulting conservatively."""
+
+    try:
+        provider = terminal_service.provider_manager.get_provider(terminal_id)
+    except Exception:  # noqa: BLE001 — error reporting must preserve the original failure
+        logger.debug(
+            "Could not resolve provider error kind for terminal %s",
+            terminal_id,
+            exc_info=True,
+        )
+        return "error"
+    if provider is not None and provider.step_error_kind == "quota":
+        return "quota"
+    return "error"
 
 
 class StepCancelledError(Exception):
@@ -216,7 +233,7 @@ async def _wait_for_completion(
     only at the next step boundary.
 
     Raises:
-        StepExecutionError(kind="error"): the terminal reached ``ERROR``.
+        StepExecutionError(kind="error"|"quota"): the terminal reached ``ERROR``.
         StepExecutionError(kind="timeout"): an explicit ``timeout`` elapsed.
         StepCancelledError: ``cancel_event`` fired while waiting.
     """
@@ -232,7 +249,7 @@ async def _wait_for_completion(
         if current == TerminalStatus.ERROR:
             raise StepExecutionError(
                 f"terminal {terminal_id} reached ERROR status",
-                kind="error",
+                kind=_terminal_error_kind(terminal_id),
                 terminal_id=terminal_id,
             )
         # send_input arms the terminal before dispatch. Until PROCESSING has
@@ -268,7 +285,7 @@ async def _wait_for_completion(
             if status_monitor.get_status(terminal_id) == TerminalStatus.ERROR:
                 raise StepExecutionError(
                     f"terminal {terminal_id} reached ERROR status",
-                    kind="error",
+                    kind=_terminal_error_kind(terminal_id),
                     terminal_id=terminal_id,
                 )
             raise StepExecutionError(
@@ -436,7 +453,7 @@ async def run_agent_step(
             Default None = behavior unchanged (profile.model, if any, still
             applies).
         reasoning_effort: Explicit provider-native effort for a freshly
-            created Codex or Claude Code terminal. ``None`` preserves the
+            created Codex, Claude Code, or Hermes terminal. ``None`` preserves the
             profile/provider default. On reuse, an explicit value must match
             the terminal's recorded launch effort.
         use_worktree: Issue #100 Phase 1. When True and a terminal is created
@@ -452,7 +469,8 @@ async def run_agent_step(
 
     Raises:
         StepExecutionError: readiness/completion wait timed out (``kind="timeout"``)
-            or the terminal reached ``TerminalStatus.ERROR`` (``kind="error"``).
+            or the terminal reached ``TerminalStatus.ERROR`` (``kind="error"`` or
+            provider-authenticated ``kind="quota"``).
             ``terminal_id`` carries the live terminal so the caller can clean up.
         StepCancelledError: ``cancel_event`` fired during the completion wait
             (issue #409b) — a cancellation, NOT a run-failure (do not retry).

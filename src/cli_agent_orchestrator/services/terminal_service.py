@@ -309,7 +309,7 @@ async def create_terminal(
             (e.g. MCP handoff/assign's own `model` parameter) pin a specific
             model for one worker without needing a dedicated agent profile.
             None = behavior unchanged (profile.model, if any, still applies).
-        reasoning_effort: Explicit native effort for Codex or Claude Code.
+        reasoning_effort: Explicit native effort for Codex, Claude Code, or Hermes.
             Other providers reject the value before allocating a terminal.
         use_worktree: If True, provision an isolated ``git worktree`` (issue
             #100) for this terminal instead of using ``working_directory`` as
@@ -398,9 +398,14 @@ async def create_terminal(
             if reasoning_effort not in REASONING_EFFORT_LEVELS:
                 allowed = ", ".join(sorted(REASONING_EFFORT_LEVELS))
                 raise ValueError(f"reasoning_effort must be one of: {allowed}")
-            if provider not in {ProviderType.CODEX.value, ProviderType.CLAUDE_CODE.value}:
+            if provider not in {
+                ProviderType.CODEX.value,
+                ProviderType.CLAUDE_CODE.value,
+                ProviderType.HERMES.value,
+            }:
                 raise ValueError(
-                    "reasoning_effort is supported only for providers 'codex' and 'claude_code'"
+                    "reasoning_effort is supported only for providers "
+                    "'codex', 'claude_code', and 'hermes'"
                 )
 
         resolved_model = model or (profile.model if profile else None)

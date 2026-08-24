@@ -48,9 +48,11 @@ def test_create_provider_hermes_stores_mapping():
         tmux_session="s1",
         tmux_window="w1",
         agent_profile=None,
+        reasoning_effort="high",
     )
 
     assert isinstance(provider, HermesProvider)
+    assert provider._reasoning_effort == "high"
     assert manager.get_provider("t1") is provider
 
 
@@ -110,6 +112,24 @@ def test_get_provider_restores_launch_policy_from_nested_metadata():
     assert provider._allowed_tools == ["*"]
     assert create.call_args.kwargs["model"] == "claude-fable-5"
     assert create.call_args.kwargs["reasoning_effort"] == "medium"
+
+
+def test_get_provider_restores_hermes_reasoning_effort():
+    manager = ProviderManager()
+    with patch(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        return_value={
+            "provider": ProviderType.HERMES.value,
+            "tmux_session": "s1",
+            "tmux_window": "w1",
+            "agent_profile": "worker",
+            "metadata": {"launch_reasoning_effort": "max"},
+        },
+    ):
+        provider = manager.get_provider("t1")
+
+    assert isinstance(provider, HermesProvider)
+    assert provider._reasoning_effort == "max"
 
 
 def test_get_provider_creates_copilot_on_demand_from_metadata():

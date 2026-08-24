@@ -593,6 +593,32 @@ class TestFailureRaises:
         assert exc_info.value.kind == "error"
         assert exc_info.value.terminal_id == "abc12345"
 
+    def test_quota_latch_raises_with_quota_kind(self):
+        """A provider-authenticated quota latch survives the ERROR status seam."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.ERROR
+        )
+        provider = MagicMock()
+        provider.step_error_kind = "quota"
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.provider_manager.get_provider",
+                return_value=provider,
+            ),
+        ):
+            with pytest.raises(StepExecutionError, match="ERROR status") as exc_info:
+                asyncio.run(run_agent_step("claude_code", "dev", "x"))
+
+        assert exc_info.value.kind == "quota"
+        assert exc_info.value.terminal_id == "abc12345"
+
     def test_error_mid_poll_stops_before_output(self):
         """An ERROR observed during the completion poll must raise (kind='error')
         and must NOT extract output — a crashed step is never a success."""

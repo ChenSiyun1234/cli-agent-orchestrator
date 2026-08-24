@@ -831,6 +831,101 @@ class TestClaudeCodeProviderStatusDetection:
         assert provider.get_status(output) == TerminalStatus.IDLE
 
 
+class TestClaudeCodeQuotaDetection:
+    """Quota typing requires a new, active Claude account-limit banner."""
+
+    @staticmethod
+    def _dispatched_provider() -> ClaudeCodeProvider:
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider._task_dispatched = True
+        provider._input_generation = 1
+        return provider
+
+    def test_active_bottom_banner_with_reset_latches_quota(self):
+        provider = self._dispatched_provider()
+        output = "✻ Working…\n" "You've hit your limit · resets 5pm (America/Los_Angeles)\n" "❯ "
+
+        assert provider.get_status(output) == TerminalStatus.ERROR
+        assert provider.step_error_kind == "quota"
+
+    def test_confirmed_monthly_spend_banner_latches_quota(self):
+        provider = self._dispatched_provider()
+        output = "You've hit your monthly spend limit · resets Sep 1\n❯ "
+
+        assert provider.get_status(output) == TerminalStatus.ERROR
+        assert provider.step_error_kind == "quota"
+
+    def test_usage_limit_banner_with_reset_remains_supported(self):
+        provider = self._dispatched_provider()
+        output = "You've reached your usage limit · resets tomorrow\n❯ "
+
+        assert provider.get_status(output) == TerminalStatus.ERROR
+        assert provider.step_error_kind == "quota"
+
+    def test_screen_path_latches_same_active_banner(self):
+        provider = self._dispatched_provider()
+        screen = [
+            "─" * 60,
+            "You've reached your account limit",
+            "Your limit will reset at 5pm",
+            "─" * 60,
+        ]
+
+        assert provider.get_status_from_screen(screen) == TerminalStatus.ERROR
+        assert provider.step_error_kind == "quota"
+
+    @pytest.mark.parametrize(
+        "ordinary_error",
+        [
+            "HTTP 429",
+            "rate_limit_error",
+            "Request timed out",
+            "API is overloaded",
+            "Authentication failed",
+            "Context length exceeded",
+            "You've used 94% of your session limit",
+            "You've hit your limit",
+        ],
+    )
+    def test_generic_or_bare_limit_text_remains_ordinary_error(self, ordinary_error):
+        provider = self._dispatched_provider()
+
+        assert provider.get_status(f"{ordinary_error}\n❯ ") != TerminalStatus.ERROR
+        assert provider.step_error_kind == "error"
+
+    def test_banner_before_dispatch_is_not_quota(self):
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        output = "You've hit your limit · resets 5pm\n❯ "
+
+        assert provider.get_status(output) != TerminalStatus.ERROR
+        assert provider.step_error_kind == "error"
+
+    @pytest.mark.parametrize(("opening", "closing"), [("```text", "```"), ("~~~text", "~~~")])
+    def test_fenced_banner_is_not_quota(self, opening, closing):
+        provider = self._dispatched_provider()
+        output = f"{opening}\nYou've hit your monthly spend limit · resets Sep 1\n{closing}\n❯ "
+
+        assert provider.get_status(output) != TerminalStatus.ERROR
+        assert provider.step_error_kind == "error"
+
+    def test_banner_outside_bottom_viewport_is_not_quota(self):
+        provider = self._dispatched_provider()
+        output = "You've hit your limit · resets 5pm\n" + "\n".join(
+            f"ordinary line {index}" for index in range(20)
+        )
+
+        assert provider.get_status(output) != TerminalStatus.ERROR
+        assert provider.step_error_kind == "error"
+
+    def test_banner_already_visible_at_dispatch_is_not_new_quota(self):
+        provider = self._dispatched_provider()
+        provider._snapshot_had_quota_banner = True
+        output = "You've hit your limit · resets 5pm\n❯ "
+
+        assert provider.get_status(output) != TerminalStatus.ERROR
+        assert provider.step_error_kind == "error"
+
+
 class TestClaudeCodeDialogDetection:
     """Tests for dialog detection anchoring and plan-approval (issue #405)."""
 
@@ -1183,12 +1278,14 @@ class TestClaudeCodeProviderNativeStatus:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider._done_first_detected = 999.0
         provider._idle_first_detected = 999.0
+        provider._quota_latched = True
 
         provider.mark_input_received()
 
         assert provider._task_dispatched is True
         assert provider._done_first_detected == 0.0
         assert provider._idle_first_detected == 0.0
+        assert provider.step_error_kind == "error"
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_native_none_falls_through_to_buffer(self, mock_backend):
@@ -1403,10 +1500,12 @@ class TestClaudeCodeProviderMisc:
         """Test cleanup resets initialized state."""
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider._initialized = True
+        provider._quota_latched = True
 
         provider.cleanup()
 
         assert provider._initialized is False
+        assert provider.step_error_kind == "error"
 
     def test_build_claude_command_no_profile(self):
         """Test building Claude command without profile."""

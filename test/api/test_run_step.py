@@ -196,6 +196,26 @@ class TestRunStepEndpoint:
         assert detail["kind"] == "error"
         assert detail["terminal_id"] == "abc12345"
 
+    def test_quota_maps_to_429_with_structured_terminal_id(self, client):
+        with patch(
+            _RUN_STEP,
+            new=AsyncMock(
+                side_effect=StepExecutionError(
+                    "terminal abc12345 reached ERROR status",
+                    kind="quota",
+                    terminal_id="abc12345",
+                )
+            ),
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+
+        assert resp.status_code == 429
+        assert resp.json()["detail"] == {
+            "message": "terminal abc12345 reached ERROR status",
+            "kind": "quota",
+            "terminal_id": "abc12345",
+        }
+
     def test_value_error_maps_to_404(self, client):
         with patch(_RUN_STEP, new=AsyncMock(side_effect=ValueError("Terminal 'x' not found"))):
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())

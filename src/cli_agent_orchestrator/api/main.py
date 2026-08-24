@@ -454,7 +454,7 @@ class RunStepRequest(BaseModel):
         default=None,
         description=(
             "Explicit provider-native reasoning effort for a freshly created "
-            "Codex or Claude Code terminal. Ignored when reusing a terminal."
+            "Codex, Claude Code, or Hermes terminal. Ignored when reusing a terminal."
         ),
     )
 
@@ -3164,8 +3164,9 @@ async def exit_terminal(
         "Failure contract: a non-2xx body is a structured object "
         "`{message, kind, terminal_id}`. **`kind` is authoritative** — "
         '`kind="error"` means the worker CRASHED (terminal reached ERROR), '
-        '`kind="timeout"` means it RAN LONG. The HTTP status mirrors `kind` '
-        "(502 = crashed, 504 = ran long) for transport-layer consumers, but a "
+        '`kind="timeout"` means it RAN LONG, and `kind="quota"` means the '
+        "provider authenticated an account-quota banner. The HTTP status mirrors `kind` "
+        "(502 = crashed, 504 = ran long, 429 = quota) for transport-layer consumers, but a "
         "caller MUST branch on `kind`, not the status code. `terminal_id` names "
         "the live terminal (read it as a field; never regex-scrape `message`)."
     ),
@@ -3190,12 +3191,13 @@ async def run_step(
     out, not just inferable from the handler):
 
     - A failed step returns a STRUCTURED detail object
-      ``{"message": str, "kind": "timeout"|"error", "terminal_id": str|None}``.
+      ``{"message": str, "kind": "timeout"|"error"|"quota", "terminal_id": str|None}``.
     - ``kind`` is the AUTHORITATIVE discriminator. ``kind="error"`` => the worker
       CRASHED (the terminal reached ``TerminalStatus.ERROR``); ``kind="timeout"``
-      => the worker RAN LONG (readiness/completion wait elapsed). The HTTP status
-      is derived FROM ``kind`` (``error`` -> 502 Bad Gateway, ``timeout`` -> 504
-      Gateway Timeout) as a convenience for transport-layer consumers — a client
+      => the worker RAN LONG (readiness/completion wait elapsed); ``kind="quota"``
+      means a provider-authenticated account quota. The HTTP status is derived
+      FROM ``kind`` (``error`` -> 502 Bad Gateway, ``timeout`` -> 504 Gateway
+      Timeout, ``quota`` -> 429 Too Many Requests) as a convenience — a client
       that can read the body MUST branch on ``kind``, not the status code.
     - ``terminal_id`` names the live terminal the step ran on (when known) so a
       caller can report/clean it up without regex-scraping ``message``.
@@ -3287,14 +3289,17 @@ async def run_step(
         )
     except StepExecutionError as e:
         # The step did not complete successfully. Distinguish a worker that
-        # CRASHED (kind="error" -> 502 Bad Gateway) from one that RAN LONG
-        # (kind="timeout" -> 504 Gateway Timeout) so the caller can tell them
-        # apart instead of reporting every failure as a timeout. The detail is a
+        # CRASHED (kind="error" -> 502 Bad Gateway), RAN LONG
+        # (kind="timeout" -> 504 Gateway Timeout), or hit a provider-authenticated
+        # account quota (kind="quota" -> 429 Too Many Requests). The detail is a
         # structured object carrying terminal_id, so callers read it as a field
         # rather than regex-scraping the message (the future engine reads it too).
         # Transition the script step RUNNING->FAILED (no-op for non-script callers).
         _settle_step(e.terminal_id, str(e))
-        code = status.HTTP_502_BAD_GATEWAY if e.kind == "error" else status.HTTP_504_GATEWAY_TIMEOUT
+        code = {
+            "error": status.HTTP_502_BAD_GATEWAY,
+            "quota": status.HTTP_429_TOO_MANY_REQUESTS,
+        }.get(e.kind, status.HTTP_504_GATEWAY_TIMEOUT)
         raise HTTPException(
             status_code=code,
             detail={"message": str(e), "kind": e.kind, "terminal_id": e.terminal_id},

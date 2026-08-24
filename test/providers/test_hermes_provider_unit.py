@@ -259,6 +259,12 @@ class TestHermesBuildCommand:
 
         assert "--model fable-5" in command
 
+    @pytest.mark.parametrize("effort", ["low", "high", "max"])
+    def test_explicit_reasoning_effort_uses_native_flag(self, effort):
+        provider = HermesProvider("tid", "sess", "win", None, reasoning_effort=effort)
+
+        assert provider._build_hermes_command().endswith(f"--reasoning {effort}")
+
     @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")
     def test_build_command_quotes_profile_with_spaces_or_shell_metacharacters(self, mock_load):
         mock_load.return_value = self._profile("test worker; rm -rf /")

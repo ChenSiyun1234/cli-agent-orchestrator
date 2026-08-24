@@ -308,6 +308,17 @@ class BaseProvider(ABC):
 
         return None
 
+    @property
+    def step_error_kind(self) -> str:
+        """Return the structured kind for a terminal ``ERROR`` state.
+
+        Most provider errors are ordinary worker failures. Providers may
+        override this only when they have stronger, provider-native evidence
+        for an existing structured kind (for example, an active quota banner).
+        """
+
+        return "error"
+
     def mark_input_received(self) -> None:
         """Notify the provider that external input was sent to the terminal.
 
