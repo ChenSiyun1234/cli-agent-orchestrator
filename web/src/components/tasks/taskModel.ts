@@ -97,20 +97,21 @@ const CONTRACT_KEY: Record<string, keyof FiveFieldContract> = {
   RETURN: 'return',
 }
 
-/** Parse the lightweight GOAL/EFFORT/SCOPE/STOP WHEN/RETURN task packet. */
-export function parseFiveFieldContract(message: string): FiveFieldContract | null {
+const CONTRACT_FIELD_LINE = /^\s*(?:#{1,6}\s+)?(?:\*\*|__)?(GOAL|EFFORT|SCOPE|STOP\s+WHEN|RETURN)(?:\*\*|__)?(?:\s*:\s*(.*)|\s*(?:#+\s*)?)$/i
+
+function parseContractLines(message: string): FiveFieldContract | null {
   const values: Record<keyof FiveFieldContract, string[]> = {
     goal: [], effort: [], scope: [], stop_when: [], return: [],
   }
   const seen = new Set<keyof FiveFieldContract>()
   let current: keyof FiveFieldContract | null = null
   message.split(/\r?\n/).forEach(line => {
-    const match = line.match(/^\s*(GOAL|EFFORT|SCOPE|STOP\s+WHEN|RETURN)\s*:\s*(.*)$/i)
+    const match = line.match(CONTRACT_FIELD_LINE)
     if (match) {
       const header = match[1].toUpperCase().replace(/\s+/g, ' ')
       current = CONTRACT_KEY[header]
       seen.add(current)
-      values[current].push(match[2])
+      values[current].push(match[2] ?? '')
     } else if (current) {
       values[current].push(line)
     }
@@ -121,6 +122,17 @@ export function parseFiveFieldContract(message: string): FiveFieldContract | nul
   ) as unknown as FiveFieldContract
   if (!parsed.goal || !parsed.scope || !parsed.stop_when || !parsed.return) return null
   return parsed
+}
+
+/** Parse the lightweight GOAL/EFFORT/SCOPE/STOP WHEN/RETURN task packet. */
+export function parseFiveFieldContract(message: string): FiveFieldContract | null {
+  const parsed = parseContractLines(message)
+  if (parsed || !message.includes('\\n')) return parsed
+
+  const normalized = message.replace(/\\r\\n|\\n/g, '\n')
+  const firstLine = normalized.split(/\r?\n/).find(line => line.trim())
+  if (!firstLine || !CONTRACT_FIELD_LINE.test(firstLine)) return null
+  return parseContractLines(normalized)
 }
 
 /**

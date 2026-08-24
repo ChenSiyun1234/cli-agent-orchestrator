@@ -4,7 +4,7 @@ import App from '../App'
 import { DashboardHome } from '../components/DashboardHome'
 import { api } from '../api'
 import { relatedInboxEndpointIds } from '../components/tasks/TaskCenter'
-import { buildTaskProjections, inboxEvidenceForTask } from '../components/tasks/taskModel'
+import { buildTaskProjections, inboxEvidenceForTask, parseFiveFieldContract } from '../components/tasks/taskModel'
 import { buildTaskReport } from '../components/tasks/taskReport'
 
 const fixture = vi.hoisted(() => ({
@@ -186,6 +186,57 @@ function persistedDirectTaskFixture(verdict: 'ACCEPT' | null = 'ACCEPT') {
     { key: 'unidlq-collaboration-protocol', memory_type: 'project', scope: 'project', scope_id: 'unidlq', updated_at: '2026-08-23T09:02:00Z' },
   ]
 }
+
+describe('five-field task contract parser', () => {
+  it('keeps the existing inline colon form', () => {
+    expect(parseFiveFieldContract([
+      'GOAL: fix lifecycle projection',
+      'EFFORT: medium',
+      'SCOPE: web/src/components/tasks',
+      'STOP WHEN: focused tests fail',
+      'RETURN: diff and test output',
+    ].join('\n'))).toEqual({
+      goal: 'fix lifecycle projection',
+      effort: 'medium',
+      scope: 'web/src/components/tasks',
+      stop_when: 'focused tests fail',
+      return: 'diff and test output',
+    })
+  })
+
+  it('parses bare and Markdown section headings', () => {
+    expect(parseFiveFieldContract([
+      'GOAL',
+      'fix persisted task projection',
+      '## EFFORT',
+      'medium',
+      '### **SCOPE**',
+      'web/src/components/tasks',
+      'STOP WHEN',
+      'focused tests fail',
+      '__RETURN__',
+      'diff and test output',
+    ].join('\n'))).toEqual({
+      goal: 'fix persisted task projection',
+      effort: 'medium',
+      scope: 'web/src/components/tasks',
+      stop_when: 'focused tests fail',
+      return: 'diff and test output',
+    })
+  })
+
+  it('normalizes literal escaped newlines only for a recognizable whole packet', () => {
+    const escapedPacket = 'GOAL\\nfix direct-58\\nEFFORT\\nmedium\\nSCOPE\\nweb/src\\nSTOP WHEN\\nfocused tests fail\\nRETURN\\ndiff and tests'
+    expect(parseFiveFieldContract(escapedPacket)).toEqual({
+      goal: 'fix direct-58',
+      effort: 'medium',
+      scope: 'web/src',
+      stop_when: 'focused tests fail',
+      return: 'diff and tests',
+    })
+    expect(parseFiveFieldContract('diagnostic text\\nGOAL\\nnot a whole task packet')).toBeNull()
+  })
+})
 
 describe('App shell — Chinese task-first navigation', () => {
   beforeEach(() => {
