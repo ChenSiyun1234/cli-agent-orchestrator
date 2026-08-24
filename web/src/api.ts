@@ -70,6 +70,12 @@ export interface Terminal {
   provider: string
   session_name: string
   agent_profile: string | null
+  caller_id?: string | null
+  allowed_tools?: string[] | null
+  engine?: string | null
+  shell_command?: string | null
+  group?: string[] | null
+  metadata?: Record<string, unknown> | null
   status: string | null
   last_active: string | null
 }
@@ -120,6 +126,18 @@ export interface InboxMessage {
   message: string
   status: 'pending' | 'delivered' | 'failed'
   created_at: string | null
+  task_id?: string | null
+  reply_to_message_id?: number | null
+  delivered_at?: string | null
+  started_at?: string | null
+  reviewed_at?: string | null
+  review_verdict?: 'ACCEPT' | 'REJECT' | null
+}
+
+export interface InboxLifecycleOptions {
+  taskId?: string | null
+  replyToMessageId?: number | null
+  reviewVerdict?: 'ACCEPT' | 'REJECT' | null
 }
 
 export interface Flow {
@@ -391,6 +409,30 @@ export interface RunSummaryRow {
   current_step_id: string | null
 }
 
+/** Journal-assembled result returned by GET /workflows/runs/{id}/result. */
+export interface WorkflowRunResult {
+  run_id: string
+  workflow_name: string
+  state: string
+  steps: Array<{
+    id: string
+    state: string
+    attempts: number
+    output?: unknown
+    error?: string | null
+  }>
+  started_at: string
+  finished_at?: string | null
+  kind?: string | null
+  failure_envelope?: Record<string, unknown>
+}
+
+export interface SubmittedWorkflowRun {
+  run_id: string
+  state: string
+  links: Record<string, string>
+}
+
 export const api = {
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
@@ -413,12 +455,18 @@ export const api = {
   deleteSession: (name: string) => fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${name}`, { method: 'DELETE' }),
 
   // Terminals
+  getTerminal: (id: string) => fetchJSON<Terminal>(`/terminals/${encodeURIComponent(id)}`),
   getTerminalStatus: (id: string) =>
-    fetchJSON<Terminal>(`/terminals/${id}`).then(t => t.status),
+    fetchJSON<Terminal>(`/terminals/${encodeURIComponent(id)}`).then(t => t.status),
   getTerminalOutput: (id: string, mode: 'full' | 'last' = 'full') =>
     fetchJSON<{ output: string; mode: string }>(`/terminals/${id}/output?mode=${mode}`),
   sendInput: (id: string, message: string) =>
     fetchJSON<{ success: boolean }>(`/terminals/${id}/input?message=${encodeURIComponent(message)}`, { method: 'POST' }),
+  sendKey: (id: string, key: string) =>
+    fetchJSON<{ success: boolean }>(
+      `/terminals/${encodeURIComponent(id)}/key?key=${encodeURIComponent(key)}`,
+      { method: 'POST' },
+    ),
   exitTerminal: (id: string) =>
     fetchJSON<{ success: boolean }>(`/terminals/${id}/exit`, { method: 'POST' }),
   deleteTerminal: (id: string) => fetchJSON<{ success: boolean }>(`/terminals/${id}`, { method: 'DELETE' }),
@@ -428,10 +476,26 @@ export const api = {
     fetchJSON<Terminal>(`/sessions/${sessionName}/terminals?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
 
   // Inbox
-  getInboxMessages: (terminalId: string, limit?: number, status?: string) =>
-    fetchJSON<InboxMessage[]>(`/terminals/${terminalId}/inbox/messages?limit=${limit || 50}${status ? `&status=${status}` : ''}`),
-  sendInboxMessage: (receiverId: string, senderId: string, message: string) =>
-    fetchJSON<{ success: boolean }>(`/terminals/${receiverId}/inbox/messages?sender_id=${senderId}&message=${encodeURIComponent(message)}`, { method: 'POST' }),
+  getInboxMessages: (terminalId: string, limit?: number, status?: string, newestFirst = false) =>
+    fetchJSON<InboxMessage[]>(`/terminals/${terminalId}/inbox/messages?limit=${limit || 50}${status ? `&status=${status}` : ''}${newestFirst ? '&newest_first=true' : ''}`),
+  sendInboxMessage: (
+    receiverId: string,
+    senderId: string,
+    message: string,
+    lifecycle?: InboxLifecycleOptions,
+  ) => {
+    const params = new URLSearchParams({ sender_id: senderId, message })
+    if (lifecycle?.taskId) params.set('task_id', lifecycle.taskId)
+    if (lifecycle?.replyToMessageId) params.set('reply_to_message_id', String(lifecycle.replyToMessageId))
+    if (lifecycle?.reviewVerdict) params.set('review_verdict', lifecycle.reviewVerdict)
+    return fetchJSON<{
+      success: boolean
+      message_id: number
+      task_id?: string | null
+      reply_to_message_id?: number | null
+      review_verdict?: 'ACCEPT' | 'REJECT' | null
+    }>(`/terminals/${receiverId}/inbox/messages?${params.toString()}`, { method: 'POST' })
+  },
 
   // Flows
   listFlows: () => fetchJSON<Flow[]>('/flows'),
@@ -528,6 +592,30 @@ export const api = {
   // are enforced server-side; this is a plain read).
   getWorkflowRunDiagnostics: (runId: string) =>
     fetchJSON<DiagnosticBundle>(`/workflows/runs/${encodeURIComponent(runId)}/diagnostics`, {
+      timeoutMs: 30000,
+    }),
+
+  getWorkflowRunResult: (runId: string) =>
+    fetchJSON<WorkflowRunResult>(`/workflows/runs/${encodeURIComponent(runId)}/result`),
+
+  // Native workflow controls. Cancel is the honest "pause at the current
+  // step" primitive for script workflows; resume replays from the durable
+  // journal and does not preserve an in-memory model context.
+  cancelWorkflowRun: (runId: string) =>
+    fetchJSON<{ success: boolean; run_id: string }>(
+      `/workflows/runs/${encodeURIComponent(runId)}/cancel`,
+      { method: 'POST', timeoutMs: 30000 },
+    ),
+  resumeWorkflowRun: (runId: string) =>
+    fetchJSON<WorkflowRunResult>(
+      `/workflows/runs/${encodeURIComponent(runId)}/resume`,
+      { method: 'POST', timeoutMs: 6 * 60 * 60 * 1000 },
+    ),
+  submitWorkflowRun: (nameOrPath: string, inputs: Record<string, unknown>, runId?: string) =>
+    fetchJSON<SubmittedWorkflowRun>('/workflows/runs:submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name_or_path: nameOrPath, inputs, ...(runId ? { run_id: runId } : {}) }),
       timeoutMs: 30000,
     }),
 

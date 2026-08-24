@@ -14,12 +14,12 @@ type TabKey = 'home' | 'agents' | 'flows' | 'settings' | 'memory' | 'workflows'
 
 // Workflows + Memory appended last so Alt+N numbering of existing tabs never shifts
 const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
-  { key: 'home', label: 'Home', icon: <Home size={16} /> },
-  { key: 'agents', label: 'Agents', icon: <Bot size={16} /> },
-  { key: 'flows', label: 'Flows', icon: <Clock size={16} /> },
-  { key: 'settings', label: 'Settings', icon: <Settings size={16} /> },
-  { key: 'memory', label: 'Memory', icon: <Brain size={16} /> },
-  { key: 'workflows', label: 'Workflows', icon: <Workflow size={16} /> },
+  { key: 'home', label: '任务中心', icon: <Home size={16} /> },
+  { key: 'agents', label: '智能体与终端', icon: <Bot size={16} /> },
+  { key: 'flows', label: '定时任务', icon: <Clock size={16} /> },
+  { key: 'settings', label: '系统设置', icon: <Settings size={16} /> },
+  { key: 'memory', label: 'CAO 记忆库', icon: <Brain size={16} /> },
+  { key: 'workflows', label: '工作流原始记录', icon: <Workflow size={16} /> },
 ]
 
 function Snackbar() {
@@ -86,14 +86,17 @@ export default function App() {
     <div className="min-h-screen bg-[#0f0f14] text-gray-200">
       {/* Header */}
       <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-sm sticky top-0 z-40">
-        <div className="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center">
+        <div className="max-w-[1800px] mx-auto px-4 sm:px-6 py-3 flex items-center justify-between">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center shrink-0">
               <Bot size={18} className="text-white" />
             </div>
-            <h1 className="text-lg font-bold text-white">CLI Agent Orchestrator</h1>
+            <div className="min-w-0">
+              <h1 className="text-lg font-bold text-white">CLI Agent Orchestrator</h1>
+              <p className="text-xs text-gray-500">UniDLQ 项目控制台 · 任务、智能体、证据与报告集中监督</p>
+            </div>
           </div>
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-4 shrink-0">
             <span className="text-xs text-gray-500">{sessions.length} session{sessions.length !== 1 ? 's' : ''}</span>
             <div className="flex items-center gap-1.5" title={connected ? 'Connected' : 'Disconnected'}>
               {connected ? (
@@ -102,7 +105,7 @@ export default function App() {
                 <WifiOff size={14} className="text-red-400" />
               )}
               <span className={`text-xs ${connected ? 'text-emerald-400' : 'text-red-400'}`}>
-                {connected ? 'Live' : 'Offline'}
+                {connected ? '实时' : '离线'}
               </span>
             </div>
           </div>
@@ -111,15 +114,15 @@ export default function App() {
 
       {/* Tab Bar */}
       <div className="border-b border-gray-800">
-        <div className="max-w-7xl mx-auto px-6">
-          <nav className="flex gap-1 py-2" role="tablist">
+        <div className="max-w-[1800px] mx-auto px-4 sm:px-6">
+          <nav className="flex gap-1 py-2 overflow-x-auto" role="tablist">
             {visibleTabs.map((t, i) => (
               <button
                 key={t.key}
                 role="tab"
                 aria-selected={tab === t.key}
                 onClick={() => setTab(t.key)}
-                className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 ${
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 whitespace-nowrap shrink-0 ${
                   tab === t.key
                     ? 'bg-gradient-to-r from-emerald-600 to-emerald-500 text-white shadow-lg shadow-emerald-500/20'
                     : 'text-gray-400 hover:text-white hover:bg-gray-800/50'
@@ -140,7 +143,7 @@ export default function App() {
       </div>
 
       {/* Content */}
-      <main className="max-w-7xl mx-auto px-6 py-6">
+      <main className="max-w-[1800px] mx-auto px-4 sm:px-6 py-6">
         <ErrorBoundary>
           <Suspense fallback={<div className="text-gray-500 text-sm py-12 text-center">Loading...</div>}>
             {tab === 'home' && <DashboardHome onNavigate={(t) => setTab(t as TabKey)} />}

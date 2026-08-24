@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
-import { X, Terminal as TermIcon } from 'lucide-react'
+import { ExternalLink, X, Terminal as TermIcon } from 'lucide-react'
 
 interface TerminalViewProps {
   terminalId: string
@@ -13,6 +13,14 @@ interface TerminalViewProps {
 
 export function TerminalView({ terminalId, provider, agentProfile, onClose }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [onClose])
 
   useEffect(() => {
     const el = containerRef.current
@@ -120,21 +128,31 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
   }, [terminalId])
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col" style={{ background: '#0d1117' }}>
+    <div className="fixed inset-0 z-50 flex flex-col" style={{ background: '#0d1117' }} role="dialog" aria-modal="true" aria-label={`原生终端 ${terminalId}`}>
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-2 bg-gray-900 border-b border-gray-700/50 shrink-0">
         <div className="flex items-center gap-3">
           <TermIcon size={16} className="text-emerald-400" />
+          <span className="text-xs font-semibold text-white">真实 tmux 终端</span>
           <span className="text-sm font-mono text-gray-300">{terminalId}</span>
           {provider && <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded">{provider}</span>}
           {agentProfile && <span className="text-xs text-emerald-400 bg-emerald-900/30 px-2 py-0.5 rounded">{agentProfile}</span>}
         </div>
         <div className="flex items-center gap-3">
-          <span className="text-[10px] text-gray-600">Click X to close</span>
+          <span className="hidden text-[10px] text-gray-600 sm:inline">双向 PTY：输入和 Ctrl+C 会直接发送到智能体</span>
+          <a
+            href={`unidlq-cao://terminal/${terminalId}`}
+            className="inline-flex items-center gap-1 rounded border border-gray-700 bg-gray-800 px-2 py-1 text-[10px] text-gray-300 hover:border-emerald-500/50 hover:text-white"
+            title="在 Windows Terminal 中附加到同一个 tmux 窗口"
+          >
+            <ExternalLink size={11} /> Windows Terminal
+          </a>
           <button
+            type="button"
             onClick={onClose}
             className="p-1 text-gray-500 hover:text-white transition-colors rounded"
-            title="Close terminal"
+            title="关闭查看器（不会停止智能体）"
+            aria-label="关闭原生终端查看器"
           >
             <X size={18} />
           </button>

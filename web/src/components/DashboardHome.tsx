@@ -7,6 +7,7 @@ import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
 import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
+import { TaskCenter } from './tasks/TaskCenter'
 
 const STATUS_ORDER = ['PROCESSING', 'IDLE', 'WAITING_USER_ANSWER', 'ERROR', 'COMPLETED', 'UNKNOWN']
 
@@ -239,6 +240,14 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
 
   return (
     <div className="space-y-6">
+      <TaskCenter onNavigate={onNavigate} />
+
+      <details className="rounded-2xl border border-gray-800 bg-gray-900/35">
+        <summary className="cursor-pointer select-none px-4 py-3 text-xs font-medium text-gray-500 transition hover:text-gray-300">
+          原版会话监控工具（高级） · Session / Terminal / Profile 视图
+        </summary>
+        <div className="space-y-6 border-t border-gray-800 p-4">
+
       {/* Stats Row */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         <div className="bg-gradient-to-br from-gray-800/80 to-gray-900/80 rounded-xl p-5 border border-gray-700/50">
@@ -471,6 +480,8 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
           })}
         </div>
       )}
+        </div>
+      </details>
 
       {/* Modals */}
       {inboxTerminalId && <InboxPanel terminalId={inboxTerminalId} onClose={() => setInboxTerminalId(null)} />}
