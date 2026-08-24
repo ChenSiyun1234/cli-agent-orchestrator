@@ -56,6 +56,7 @@ type TaskFilter = 'all' | 'active' | 'review' | 'direct'
 const EMPTY_TIMELINE: EventTimelinePage = { events: [], gaps: [], next_after_seq: null }
 const TERMINAL_STATES = new Set(['completed', 'failed', 'cancelled'])
 const ACTIVE_TASK_STATES = new Set(['running', 'processing', 'quiet_running', 'waiting_user_answer', 'queued'])
+const MAX_RELATED_INBOX_ENDPOINTS = 64
 
 const STATE_LABEL: Record<string, string> = {
   running: '正在推进',
@@ -131,6 +132,32 @@ function receiptEvidence(
     diagnostics: previous?.diagnostics || null,
     result: previous?.result || null,
   }
+}
+
+/**
+ * Return one bounded, deterministic expansion of inbox endpoint identities.
+ *
+ * Direct-task rows outlive their one-off worker terminal. A reply received by
+ * a still-live architect records the deleted worker as its sender, which lets
+ * the existing receiver-scoped inbox endpoint retrieve that worker's persisted
+ * ASSIGN root. This deliberately performs only one hop and never invents a
+ * terminal, message, or lifecycle transition.
+ */
+export function relatedInboxEndpointIds(
+  messages: InboxMessage[],
+  fetchedEndpointIds: Iterable<string>,
+  limit = MAX_RELATED_INBOX_ENDPOINTS,
+): string[] {
+  const fetched = new Set(fetchedEndpointIds)
+  const related = new Set<string>()
+  messages.forEach(message => {
+    for (const id of [message.sender_id, message.receiver_id]) {
+      if (id && !fetched.has(id)) related.add(id)
+    }
+  })
+  return [...related]
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+    .slice(0, Math.max(0, limit))
 }
 
 function TaskListCard({ task, selected, onSelect }: { task: TaskProjection; selected: boolean; onSelect: () => void }) {
@@ -358,11 +385,19 @@ export function TaskCenter({ onNavigate }: { onNavigate: (tab: string) => void }
           return mergeTerminal(meta)
         }
       }))
-      const [inboxGroups, memories] = await Promise.all([
+      const liveInboxIds = hydrated.map(terminal => terminal.id)
+      const [liveInboxGroups, memories] = await Promise.all([
         Promise.all(hydrated.map(terminal => api.getInboxMessages(terminal.id, 100, undefined, true).catch(() => []))),
         api.listMemories({ scope: 'project', limit: 100 }).catch(() => [] as MemorySummary[]),
       ])
-      const inboxRows = [...new Map(inboxGroups.flat().map(message => [String(message.id), message])).values()]
+      const liveInboxRows = [...new Map(liveInboxGroups.flat().map(message => [String(message.id), message])).values()]
+      const relatedInboxIds = relatedInboxEndpointIds(liveInboxRows, liveInboxIds)
+      const relatedInboxGroups = await Promise.all(relatedInboxIds.map(terminalId => (
+        api.getInboxMessages(terminalId, 100, undefined, true).catch(() => [])
+      )))
+      const inboxRows = [...new Map(
+        [...liveInboxRows, ...relatedInboxGroups.flat()].map(message => [String(message.id), message]),
+      ).values()]
 
       const selectedRunId = selectedIdRef.current && runRows.some(run => run.run_id === selectedIdRef.current)
         ? selectedIdRef.current

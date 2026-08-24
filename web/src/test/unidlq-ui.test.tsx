@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import App from '../App'
 import { DashboardHome } from '../components/DashboardHome'
 import { api } from '../api'
+import { relatedInboxEndpointIds } from '../components/tasks/TaskCenter'
 import { buildTaskProjections, inboxEvidenceForTask } from '../components/tasks/taskModel'
 import { buildTaskReport } from '../components/tasks/taskReport'
 
@@ -406,6 +407,30 @@ describe('Task center — graphical supervision and native controls', () => {
       { step: '返回 → 审核', duration_ms: 60000 },
     ])
     expect(report.provenance.inbox_binding).toContain('persisted task_id')
+  })
+
+  it('keeps a persisted ASSIGN task visible after its one-off worker terminal is deleted', async () => {
+    persistedDirectTaskFixture('ACCEPT')
+    fixture.terminals = fixture.terminals.filter(terminal => terminal.id === 'aaaaaaaa')
+    store.sessions = fixture.sessions
+    render(<DashboardHome onNavigate={() => {}} />)
+
+    expect(await screen.findByText('修复直接任务生命周期')).toBeInTheDocument()
+    expect(screen.getByText('持久直接任务')).toBeInTheDocument()
+    expect(screen.getByText('明确结论：ACCEPT')).toBeInTheDocument()
+    expect(api.getInboxMessages).toHaveBeenCalledWith('aaaaaaaa', 100, undefined, true)
+    expect(api.getInboxMessages).toHaveBeenCalledWith('bbbbbbbb', 100, undefined, true)
+  })
+
+  it('bounds and sorts the one-hop inbox endpoint expansion', () => {
+    const messages = [
+      { sender_id: 'worker-z', receiver_id: 'architect' },
+      { sender_id: 'worker-a', receiver_id: 'architect' },
+      { sender_id: 'worker-m', receiver_id: 'architect' },
+    ] as any[]
+
+    expect(relatedInboxEndpointIds(messages, ['architect'], 2)).toEqual(['worker-a', 'worker-m'])
+    expect(relatedInboxEndpointIds(messages, ['architect'], 0)).toEqual([])
   })
 
   it('labels old direct-task linkage as historical inference and never calls quiet work frozen', () => {

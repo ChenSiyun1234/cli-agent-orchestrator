@@ -12,6 +12,7 @@ from cli_agent_orchestrator.clients.database import (
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
+    mark_message_started,
     update_message_status,
 )
 from cli_agent_orchestrator.constants import (
@@ -131,6 +132,19 @@ class InboxService:
                         sender_id=sender_id,
                         orchestration_type=orchestration_type,
                     )
+                if orchestration_type == OrchestrationType.ASSIGN:
+                    for message in batch:
+                        try:
+                            mark_message_started(message.id)
+                        except Exception as e:
+                            # The terminal already received the task.  Never
+                            # mislabel that successful delivery as FAILED (or
+                            # retry it) because only the evidence write failed.
+                            logger.error(
+                                "Failed to persist task start for message %s: %s",
+                                message.id,
+                                e,
+                            )
                 logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
             except TerminalNotFoundError as e:
                 # Pane not resolvable yet (e.g. a herdr pane that isn't mapped

@@ -1816,6 +1816,33 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
         return False
 
 
+def mark_message_started(message_id: int) -> bool:
+    """Persist the first successful terminal submission of a direct ASSIGN root.
+
+    ``deliver_pending`` marks a row DELIVERED before calling ``send_input`` to
+    close the inbox re-entrancy race.  The task only becomes executable after
+    that call returns successfully, so this transition is intentionally
+    separate from ``update_message_status``.  Non-task messages and rows that
+    are not currently DELIVERED are left unchanged.
+    """
+    with SessionLocal() as db:
+        message = db.query(InboxModel).filter(InboxModel.id == message_id).first()
+        if message is None:
+            return False
+        if not (
+            message.status == MessageStatus.DELIVERED.value
+            and message.orchestration_type == OrchestrationType.ASSIGN.value
+            and isinstance(message.task_id, str)
+            and message.task_id
+            and message.reply_to_message_id is None
+        ):
+            return False
+        if message.started_at is None:
+            message.started_at = datetime.now()
+            db.commit()
+        return True
+
+
 # Flow database functions
 
 

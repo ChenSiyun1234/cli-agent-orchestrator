@@ -31,6 +31,7 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_receiver_ids_older_than,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
+    mark_message_started,
     update_flow_enabled,
     update_flow_run_times,
     update_last_active,
@@ -1079,6 +1080,7 @@ class TestInboxOperations:
             assert root.orchestration_type == OrchestrationType.ASSIGN
 
             assert update_message_status(root.id, MessageStatus.DELIVERED) is True
+            assert mark_message_started(root.id) is True
             returned = create_inbox_message("worker", "architect", "Implemented; tests pass.")
             assert returned.task_id == root.task_id
             assert returned.reply_to_message_id == root.id
@@ -1101,7 +1103,8 @@ class TestInboxOperations:
 
         persisted_root = next(message for message in worker_inbox if message.id == root.id)
         assert persisted_root.delivered_at is not None
-        assert persisted_root.started_at is None
+        assert persisted_root.started_at is not None
+        assert persisted_root.started_at >= persisted_root.delivered_at
         assert persisted_root.reviewed_at is not None
         assert persisted_root.review_verdict == "ACCEPT"
         assert architect_inbox[0].message == "Implemented; tests pass."
@@ -1222,6 +1225,24 @@ class TestInboxOperations:
         assert persisted.status == MessageStatus.FAILED
         assert persisted.delivered_at is None
         assert persisted.started_at is None
+
+    def test_only_delivered_assign_root_can_be_marked_started(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("worker", "cao-s", "worker", "claude_code")
+            pending_root = create_inbox_message(
+                "architect",
+                "worker",
+                "GOAL: task",
+                orchestration_type=OrchestrationType.ASSIGN,
+            )
+            routine = create_inbox_message("architect", "worker", "routine update")
+            update_message_status(routine.id, MessageStatus.DELIVERED)
+
+            assert mark_message_started(pending_root.id) is False
+            assert mark_message_started(routine.id) is False
+            messages = get_inbox_messages("worker", limit=10)
+
+        assert all(message.started_at is None for message in messages)
 
     def test_newest_window_is_selected_but_returned_chronologically(self, test_db):
         with test_db() as seed:

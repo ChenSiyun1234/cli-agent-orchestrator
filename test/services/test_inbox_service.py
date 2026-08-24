@@ -192,6 +192,7 @@ class TestDeliverPending:
         assert order[0] == ("update", (1, MessageStatus.DELIVERED))
         assert order[1][0] == "send"
 
+    @patch("cli_agent_orchestrator.services.inbox_service.mark_message_started")
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
@@ -202,6 +203,7 @@ class TestDeliverPending:
         mock_monitor,
         mock_term_svc,
         mock_update,
+        mock_mark_started,
     ):
         mock_get.return_value = [_make_message(orchestration_type=OrchestrationType.ASSIGN)]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
@@ -215,6 +217,34 @@ class TestDeliverPending:
             registry=None,
             sender_id="sender-1",
             orchestration_type=OrchestrationType.ASSIGN,
+        )
+        mock_mark_started.assert_called_once_with(1)
+
+    @patch("cli_agent_orchestrator.services.inbox_service.mark_message_started")
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_assign_send_failure_does_not_mark_task_started(
+        self,
+        mock_get,
+        mock_monitor,
+        mock_term_svc,
+        mock_update,
+        mock_mark_started,
+    ):
+        mock_get.return_value = [_make_message(orchestration_type=OrchestrationType.ASSIGN)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.send_input.side_effect = RuntimeError("tmux error")
+
+        InboxService().deliver_pending("term-1")
+
+        mock_mark_started.assert_not_called()
+        mock_update.assert_has_calls(
+            [
+                call(1, MessageStatus.DELIVERED),
+                call(1, MessageStatus.FAILED),
+            ]
         )
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
