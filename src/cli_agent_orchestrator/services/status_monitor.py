@@ -899,9 +899,45 @@ class StatusMonitor:
                 and fresh != TerminalStatus.PROCESSING
                 and fresh != TerminalStatus.UNKNOWN
             ):
+                # A screen provider's composited viewport sampled at an arbitrary
+                # poll instant can be a torn / spinner-erased mid-burst redraw
+                # even though the agent is still streaming its answer. Codex in
+                # particular shows the idle composer + earlier response bullets
+                # while the work spinner is momentarily absent between chunks, so
+                # get_status_from_screen classifies that interim frame COMPLETED
+                # (or IDLE) — base.get_status_from_screen is only contracted on
+                # the rising/quiescence edges, "never mid-burst". Honoring that
+                # single interim frame let run_step extract a partial answer
+                # (e.g. only 6 of 20 requested lines) and tear the worker down.
+                #
+                # Accept a "looks-done" downgrade (COMPLETED/IDLE) only once the
+                # byte stream has actually gone quiet; while output is still
+                # bursting keep PROCESSING and let the quiescence-edge detection
+                # make the authoritative transition off a settled frame. This
+                # distinguishes live output from quiescence via real stream
+                # activity, not a wall-clock guess. ERROR / WAITING_USER_ANSWER
+                # are genuine interrupts (crash, approval prompt) and still
+                # surface immediately even mid-burst.
+                if (
+                    use_screen
+                    and fresh in (TerminalStatus.COMPLETED, TerminalStatus.IDLE)
+                    and self._is_bursting(terminal_id)
+                ):
+                    return cached
                 self._apply_detection(terminal_id, fresh, generation)
                 return fresh
         return cached
+
+    def _is_bursting(self, terminal_id: str) -> bool:
+        """Return whether output is still actively streaming for a terminal.
+
+        True between the first chunk of a burst and the quiescence timer firing
+        ``PYTE_QUIESCENCE_DELAY_S`` after the last chunk. Used by the poll-time
+        refresh to distinguish a torn mid-burst composited frame from a settled
+        end-of-turn frame.
+        """
+        with self._lock:
+            return self._bursting.get(terminal_id, False)
 
     def get_buffer(self, terminal_id: str) -> str:
         """Get accumulated output buffer for a terminal."""

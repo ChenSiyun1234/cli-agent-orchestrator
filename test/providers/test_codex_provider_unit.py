@@ -1122,6 +1122,58 @@ class TestCodexProviderStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
+    def test_interim_streamed_answer_with_spinner_is_processing(self):
+        """Mid-stream frame with the work spinner is PROCESSING (still working).
+
+        Codex is streaming a 20-line answer and has emitted 6 lines so far; the
+        "• Working (Ns • esc to interrupt)" spinner is present, so the frame must
+        classify PROCESSING and never end the step.
+        """
+        output = (
+            "› List REPRO_BEGIN, ITEM_01..ITEM_20, REPRO_END\n"
+            "• REPRO_BEGIN\n"
+            "• ITEM_01\n"
+            "• ITEM_02\n"
+            "• ITEM_03\n"
+            "• ITEM_04\n"
+            "• ITEM_05\n"
+            "• ITEM_06\n"
+            "• Working (3s • esc to interrupt)\n"
+            "› \n"
+            "  ? for shortcuts                     92% context left\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_interim_streamed_answer_without_spinner_classifies_completed(self):
+        """A torn interim frame (spinner momentarily erased) reads COMPLETED.
+
+        This pins the underlying hazard: the identical 6-of-20 streamed frame,
+        with the work spinner momentarily absent from the composited viewport,
+        satisfies Codex's COMPLETED heuristic (idle composer + assistant bullet,
+        no spinner) even though the answer is unfinished. StatusMonitor's
+        burst-gate (see test_processing_poll_refresh_defers_completed_while_bursting)
+        is what stops this interim classification from ending the step.
+        """
+        output = (
+            "› List REPRO_BEGIN, ITEM_01..ITEM_20, REPRO_END\n"
+            "• REPRO_BEGIN\n"
+            "• ITEM_01\n"
+            "• ITEM_02\n"
+            "• ITEM_03\n"
+            "• ITEM_04\n"
+            "• ITEM_05\n"
+            "• ITEM_06\n"
+            "› \n"
+            "  ? for shortcuts                     92% context left\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
 
 class TestCodexRenderedScreenStatusDetection:
     """Regression coverage for in-place Codex TUI redraws.

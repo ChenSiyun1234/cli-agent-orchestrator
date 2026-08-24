@@ -722,6 +722,40 @@ class TestIdleCompletionSignal:
             result = asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
         assert result.status == TerminalStatus.COMPLETED
 
+    def test_interim_processing_then_completed_waits_for_real_completion(self):
+        """A still-streaming step must resolve only on the settled completion.
+
+        StatusMonitor now holds PROCESSING while a screen provider is still
+        bursting (see status_monitor's burst-gate), so a mid-stream interim frame
+        surfaces to the completion wait as PROCESSING, not COMPLETED. The step
+        must poll through those interim reads and extract output only once the
+        real COMPLETED arrives — not truncate the answer on an early poll.
+        """
+        seq = [
+            TerminalStatus.PROCESSING,  # observed working
+            TerminalStatus.PROCESSING,  # interim frame held as PROCESSING (bursting)
+            TerminalStatus.PROCESSING,  # still streaming
+            TerminalStatus.COMPLETED,  # settled -> done
+        ]
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            status_sequence=seq,
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output as m_out,
+            exit_cli,
+            wait,
+            status as m_status,
+            patch(f"{_MODULE}.asyncio.sleep", new=AsyncMock()),
+        ):
+            result = asyncio.run(run_agent_step("codex", "dev", "x"))
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == "the answer"
+        assert m_status.call_count == 4
+        m_out.assert_called_once_with("abc12345", OutputMode.LAST)
+
     def test_stale_completed_marker_waits_for_new_turn(self):
         """An armed previous-turn COMPLETED cannot finish newly-sent work."""
         from cli_agent_orchestrator.services.agent_step import _wait_for_completion

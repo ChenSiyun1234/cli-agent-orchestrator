@@ -176,6 +176,115 @@ class TestScreenDetection:
             "new response and ready composer"
         )
 
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_processing_poll_refresh_defers_completed_while_bursting(
+        self, mock_get_backend, mock_pm
+    ):
+        """A completed-looking interim frame must not end the step mid-stream.
+
+        The observed run_step failure: Codex is still streaming its answer (only
+        6 of 20 requested lines emitted) but a poll-time screen sample caught a
+        torn / spinner-erased redraw and returned COMPLETED, so run_step
+        extracted a partial answer and tore the worker down. While output is
+        still bursting, keep PROCESSING and leave the latch untouched.
+        """
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "partial streamed answer, still writing"
+        sm._bursting["t1"] = True
+        sm._detect_screen = MagicMock(return_value=TerminalStatus.COMPLETED)
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        # The interim frame must not be latched as a real completion.
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_processing_poll_refresh_defers_idle_while_bursting(self, mock_get_backend, mock_pm):
+        """An idle-looking interim frame is deferred the same way as completed."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "partial streamed answer, still writing"
+        sm._bursting["t1"] = True
+        sm._detect_screen = MagicMock(return_value=TerminalStatus.IDLE)
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_processing_poll_refresh_accepts_completed_when_quiescent(
+        self, mock_get_backend, mock_pm
+    ):
+        """Once output has settled (not bursting), a genuine completion still flips."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "final answer and ready composer"
+        sm._bursting["t1"] = False
+        sm._detect_screen = MagicMock(return_value=TerminalStatus.COMPLETED)
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_processing_poll_refresh_surfaces_error_even_while_bursting(
+        self, mock_get_backend, mock_pm
+    ):
+        """A crash mid-burst is a genuine interrupt and must surface immediately."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "traceback while streaming"
+        sm._bursting["t1"] = True
+        sm._detect_screen = MagicMock(return_value=TerminalStatus.ERROR)
+
+        assert sm.get_status("t1") == TerminalStatus.ERROR
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_processing_poll_refresh_surfaces_waiting_even_while_bursting(
+        self, mock_get_backend, mock_pm
+    ):
+        """An approval prompt mid-burst is a genuine interrupt and surfaces immediately."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "approve? y/n"
+        sm._bursting["t1"] = True
+        sm._detect_screen = MagicMock(return_value=TerminalStatus.WAITING_USER_ANSWER)
+
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+
     def test_stale_async_detection_cannot_consume_new_generation(self):
         sm = StatusMonitor()
         sm._last_status["t1"] = TerminalStatus.COMPLETED
