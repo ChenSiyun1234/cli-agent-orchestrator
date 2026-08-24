@@ -2325,6 +2325,149 @@ class TestClaudeCodeScreenDetection:
         ]
         assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
 
+    def test_live_tool_after_interim_response_returns_temporal_sample(self):
+        screen = [
+            "● The first two checks passed. Running the final gate now.",
+            "  Bash(python -m pytest -q tests/test_resume.py)",
+            "  ⎿ \xa0Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+        provider = self._p()
+
+        assert provider.get_status_from_screen(screen) == TerminalStatus.PROCESSING
+        sample = provider.current_turn_processing_sample("\n".join(screen))
+        assert sample is not None
+        identity, dynamic_values = sample
+        assert identity.startswith("running-tool:timeout 10m:row=2:context=")
+        assert "Bash(python -m pytest -q tests/test_resume.py)" in identity
+        assert dynamic_values == (
+            ("running_elapsed", "1m 5s"),
+            ("spinner_glyph", "✢"),
+            ("spinner_elapsed", "4m 23s"),
+            ("token_count", "↓6.2k"),
+        )
+
+    def test_stale_tool_spinner_before_finished_response_has_no_temporal_sample(self):
+        screen = [
+            "  ⎿ \xa0Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+            "● All tests passed.",
+            "✻ Baked for 4m 24s",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+
+        assert self._p().current_turn_processing_sample("\n".join(screen)) is None
+
+    def test_markdown_testing_bullet_does_not_confirm_processing(self):
+        """Reviewer HIGH-2: ordinary response prose is never live TUI evidence."""
+        for prose_line in (
+            "* Testing… all checks passed",
+            "· Testing… all checks passed",
+        ):
+            screen = [
+                "● Here is the current checklist:",
+                prose_line,
+                "─" * 60,
+                "❯",
+                "─" * 60,
+            ]
+
+            assert self._p().current_turn_processing_sample("\n".join(screen)) is None
+
+    def test_markdown_background_wait_bullet_does_not_confirm_processing(self):
+        screen = [
+            "● Remaining notes:",
+            "* Waiting for background tasks to finish",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+
+        assert self._p().current_turn_processing_sample("\n".join(screen)) is None
+
+    def test_background_wait_without_complete_running_schema_is_ineligible(self):
+        screen = [
+            "● The workflow has started.",
+            "✻ Waiting for 1 dynamic workflow to finish",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+
+        assert self._p().current_turn_processing_sample("\n".join(screen)) is None
+
+    def test_fenced_terminal_transcript_has_no_temporal_sample(self):
+        screen = [
+            "● Captured terminal transcript:",
+            "```text",
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+            "  ⎿ Running… (1m 6s · timeout 10m)",
+            "✶ Forging… (4m 24s · ↓ 6.3k tokens)",
+            "```",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+
+        assert self._p().current_turn_processing_sample("\n".join(screen)) is None
+
+    def test_two_unfenced_quoted_rows_form_only_one_candidate_sample(self):
+        """Two timestamps in one static frame are not a temporal comparison."""
+        screen = [
+            "● Captured terminal transcript:",
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+            "  ⎿ Running… (1m 6s · timeout 10m)",
+            "✶ Forging… (4m 24s · ↓ 6.3k tokens)",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+
+        sample = self._p().current_turn_processing_sample("\n".join(screen))
+        assert sample is not None
+        identity, dynamic_values = sample
+        assert identity.startswith("running-tool:timeout 10m:row=3:context=")
+        assert "⎿ Running… (1m 5s · timeout 10m)" in identity
+        assert dynamic_values == (
+            ("running_elapsed", "1m 6s"),
+            ("spinner_glyph", "✶"),
+            ("spinner_elapsed", "4m 24s"),
+            ("token_count", "↓6.3k"),
+        )
+
+    def test_bare_spinner_is_ineligible_until_all_dynamic_fields_exist(self):
+        screen = [
+            "● Running the final gate now.",
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging…",
+        ]
+
+        assert self._p().current_turn_processing_sample("\n".join(screen)) is None
+
+    def test_arbitrary_spinner_line_suffix_is_not_a_dynamic_field(self):
+        first = [
+            "● Running the final gate now.",
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+        ]
+        prose_growth = [
+            "● Running the final gate now.",
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens) all checks passed",
+        ]
+        provider = self._p()
+
+        assert provider.current_turn_processing_sample("\n".join(first)) == (
+            provider.current_turn_processing_sample("\n".join(prose_growth))
+        )
+
     def test_response_plus_prompt_is_completed(self):
         screen = [
             "● Done — fib.py created and tests pass.",

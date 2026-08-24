@@ -11,7 +11,7 @@ import stat
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -205,6 +205,27 @@ GET_STATUS_COMPLETION_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\b"
 BACKGROUND_WAIT_PATTERN = re.compile(
     r"(?m)^[ \t\xa0]*[✶✢✽✻✳·*][ \t\xa0]+Waiting for\b"
     r"(?=[^\n]*\b(?:workflows?|tasks?|to finish|background)\b)"
+)
+# A foreground Bash/tool call that Claude Code is still awaiting.  Unlike the
+# generic response text "running", this is anchored to the TUI's tool-result
+# continuation glyph and its live ``Running… (elapsed · timeout ...)`` chrome.
+# The row is repainted with the command result when the child exits.
+RUNNING_TOOL_PATTERN = re.compile(
+    r"(?m)^[ \t]*⎿[ \t\xa0]+Running…" r"(?:[ \t\xa0]*\((?P<running_details>[^\n)]*)\)|[ \t\xa0]*$)"
+)
+# Dynamic chrome associated with an already-anchored running/wait candidate.
+# ``*``/``·`` are safe here because this row never authenticates liveness by
+# itself; StatusMonitor still requires it to change in a later screen sample.
+PROCESSING_DYNAMIC_PATTERN = re.compile(
+    r"(?m)^[ \t]*(?P<dynamic_glyph>[✶✢✽✻✳·*])[ \t\xa0]+"
+    r"\w*ing\b[^\n…]*…"
+    r"(?:[ \t\xa0]*\((?P<dynamic_details>[^)\n]*)\))?"
+)
+PROCESSING_ELAPSED_PATTERN = re.compile(
+    r"^[ \t]*(?P<elapsed>\d+(?:\.\d+)?[hms](?:[ \t]+\d+(?:\.\d+)?[hms])*)\b"
+)
+PROCESSING_TOKEN_PATTERN = re.compile(
+    r"(?P<direction>[↑↓])[ \t]*(?P<count>\d+(?:\.\d+)?(?:[kKmM])?)[ \t]+tokens?\b"
 )
 # The newest Claude Code TUI renders the ❯ input prompt BOXED between two
 # horizontal separator lines (the older TUI used a single separator ABOVE ❯).
@@ -1166,6 +1187,98 @@ class ClaudeCodeProvider(BaseProvider):
             return TerminalStatus.IDLE
 
         return TerminalStatus.UNKNOWN
+
+    def current_turn_processing_sample(
+        self, output: str
+    ) -> Optional[Tuple[str, Tuple[Tuple[str, str], ...]]]:
+        """Return one complete, keyed temporal candidate after a ready frame.
+
+        Claude can briefly render a response plus ready composer, then start a
+        foreground tool in the *same* turn.  No new CAO input is sent in that
+        case.  Expose only the latest foreground-running anchor newer than every
+        response/completion marker, and only after running elapsed, spinner
+        glyph, spinner elapsed, and token count are all present in that frame.
+        StatusMonitor then validates the fixed key schema across three samples.
+        Code-fenced transcript rows are removed before parsing, and the bounded
+        viewport context makes append/scroll frames different candidates.
+        """
+
+        clean = strip_terminal_escapes(output)
+        visible_lines = []
+        in_fence = False
+        for line in clean.splitlines():
+            if line.lstrip().startswith("```"):
+                in_fence = not in_fence
+                visible_lines.append("")
+            elif in_fence:
+                visible_lines.append("")
+            else:
+                visible_lines.append(line)
+        tail = "\n".join(visible_lines[-30:])
+        if not tail:
+            return None
+
+        candidates = [(m.start(), m) for m in RUNNING_TOOL_PATTERN.finditer(tail)]
+        if not candidates:
+            return None
+
+        ready_positions = [m.start() for m in EXTRACTION_RESPONSE_PATTERN.finditer(tail)]
+        for completion in re.finditer(GET_STATUS_COMPLETION_PATTERN, tail):
+            if "Waiting" not in completion.group(0):
+                ready_positions.append(completion.start())
+
+        position, candidate = max(candidates, key=lambda item: item[0])
+        if position <= max(ready_positions, default=-1):
+            return None
+        # The row is part of the candidate identity.  A real live row repaints
+        # in place; a response that progressively prints two quoted timestamps
+        # appends the second one on a different physical viewport row.  This is
+        # intentionally conservative if unrelated output scrolls the live row.
+        row_index = tail.count("\n", 0, position)
+        tail_lines = tail.splitlines()
+        running_details = (candidate.group("running_details") or "").strip()
+        running_elapsed = PROCESSING_ELAPSED_PATTERN.search(running_details)
+        if running_elapsed is None:
+            return None
+        _, separator, stable_detail = running_details.partition("·")
+        stable_detail = stable_detail.strip() if separator else "foreground"
+
+        spinner = PROCESSING_DYNAMIC_PATTERN.search(tail, candidate.end())
+        if spinner is None:
+            return None
+        spinner_details = spinner.group("dynamic_details") or ""
+        spinner_elapsed = PROCESSING_ELAPSED_PATTERN.search(spinner_details)
+        spinner_tokens = PROCESSING_TOKEN_PATTERN.search(spinner_details)
+        if spinner_elapsed is None or spinner_tokens is None:
+            return None
+
+        spinner_row = tail.count("\n", 0, spinner.start())
+        excluded_rows = {row_index, spinner_row}
+        context_rows_before = [
+            f"{index}:{' '.join(line.split())}"
+            for index, line in enumerate(tail_lines)
+            if index < row_index and index not in excluded_rows and line.strip()
+        ]
+        context_rows_after = [
+            f"{index}:{' '.join(line.split())}"
+            for index, line in enumerate(tail_lines)
+            if index > spinner_row and index not in excluded_rows and line.strip()
+        ]
+        # Serialize the pre-tool window first: even many stable footer/prompt
+        # rows below the candidate cannot truncate away the Bash header or the
+        # scrolled transcript rows that distinguish two quoted candidates.
+        local_context = " / ".join([*context_rows_before[-4:], *context_rows_after[:2]]) or "none"
+        identity = f"running-tool:{stable_detail}:row={row_index}:context={local_context}"
+        dynamic_values = (
+            ("running_elapsed", running_elapsed.group("elapsed")),
+            ("spinner_glyph", spinner.group("dynamic_glyph")),
+            ("spinner_elapsed", spinner_elapsed.group("elapsed")),
+            (
+                "token_count",
+                f"{spinner_tokens.group('direction')}" f"{spinner_tokens.group('count').lower()}",
+            ),
+        )
+        return identity, dynamic_values
 
     @property
     def paste_submit_delay(self) -> float:

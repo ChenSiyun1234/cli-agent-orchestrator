@@ -10,6 +10,7 @@ import threading
 from unittest.mock import MagicMock, patch
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
 
@@ -205,6 +206,508 @@ class TestScreenDetection:
         assert sm._detect_screen("t1", provider) == TerminalStatus.IDLE
         provider.get_status.assert_called_once_with("raw buffer with idle footer")
         mock_pm.get_provider.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_three_in_place_live_repaints_reopen_idle_and_completed(self, mock_bus):
+        """A live foreground tool may start after an interim ready repaint.
+
+        Three complete screens with the same identity, two successive dynamic
+        changes, and a spinner-glyph cycle may override the ready latch.
+        """
+
+        first_frame = [
+            "● Running the final gate now.",
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+        second_frame = [
+            "● Running the final gate now.",
+            "  ⎿ Running… (1m 6s · timeout 10m)",
+            "✶ Forging… (4m 24s · ↓ 6.3k tokens)",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+        third_frame = [
+            "● Running the final gate now.",
+            "  ⎿ Running… (1m 7s · timeout 10m)",
+            "✻ Forging… (4m 25s · ↓ 6.4k tokens)",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+        screen = MagicMock()
+        provider = ClaudeCodeProvider("t1", "session", "window")
+        for ready_status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+            mock_bus.reset_mock()
+            sm = StatusMonitor()
+            sm._screens["t1"] = (screen, MagicMock())
+            sm._last_status["t1"] = ready_status
+
+            screen.display = first_frame
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+            assert sm._last_status["t1"] == ready_status
+            mock_bus.publish.assert_not_called()
+
+            screen.display = second_frame
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+            assert sm._last_status["t1"] == ready_status
+            mock_bus.publish.assert_not_called()
+
+            screen.display = third_frame
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+            assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+            mock_bus.publish.assert_called_once_with(
+                "terminal.t1.status", {"status": TerminalStatus.PROCESSING.value}
+            )
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_static_fenced_and_unfenced_transcripts_remain_latched(self, mock_bus):
+        """Two quoted timestamps in one frame never count as two observations."""
+        transcript = [
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+            "  ⎿ Running… (1m 6s · timeout 10m)",
+            "✶ Forging… (4m 24s · ↓ 6.3k tokens)",
+        ]
+        frames = [
+            ["● Captured terminal transcript:", *transcript, "─" * 60, "❯", "─" * 60],
+            [
+                "● Captured terminal transcript:",
+                "```text",
+                *transcript,
+                "```",
+                "─" * 60,
+                "❯",
+                "─" * 60,
+            ],
+        ]
+        provider = ClaudeCodeProvider("t1", "session", "window")
+
+        for frame in frames:
+            mock_bus.reset_mock()
+            screen = MagicMock()
+            screen.display = frame
+            sm = StatusMonitor()
+            sm._screens["t1"] = (screen, MagicMock())
+            sm._last_status["t1"] = TerminalStatus.COMPLETED
+
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+            assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+            mock_bus.publish.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_progressively_appended_unfenced_transcript_remains_latched(self, mock_bus):
+        """A later quoted timestamp is a new row, not an in-place repaint."""
+        first_quote = [
+            "● Captured terminal transcript:",
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+        appended_quote = [
+            "● Captured terminal transcript:",
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+            "  ⎿ Running… (1m 6s · timeout 10m)",
+            "✶ Forging… (4m 24s · ↓ 6.3k tokens)",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+        provider = ClaudeCodeProvider("t1", "session", "window")
+        screen = MagicMock()
+        sm = StatusMonitor()
+        sm._screens["t1"] = (screen, MagicMock())
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+
+        screen.display = first_quote
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+        screen.display = appended_quote
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        mock_bus.publish.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_bare_spinner_then_completed_fields_does_not_advance_streak(self, mock_bus):
+        """Field appearance is eligibility, not a temporal value change."""
+        bare_spinner = [
+            "● Running the final gate now.",
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging…",
+        ]
+        completed_fields = [
+            "● Running the final gate now.",
+            "  ⎿ Running… (1m 6s · timeout 10m)",
+            "✶ Forging… (4m 24s · ↓ 6.3k tokens)",
+        ]
+        provider = ClaudeCodeProvider("t1", "session", "window")
+        screen = MagicMock()
+        sm = StatusMonitor()
+        sm._screens["t1"] = (screen, MagicMock())
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+
+        screen.display = bare_spinner
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+        screen.display = completed_fields
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        mock_bus.publish.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_fixed_viewport_scrolling_quote_rows_remain_latched(self, mock_bus):
+        """Quoted history sliding through the same bottom rows changes viewport identity."""
+        stable_footers = [f"stable-footer-{index}" for index in range(6)]
+        frames = [
+            [
+                "● Captured terminal transcript:",
+                "  Bash(same-command)",
+                "  ⎿ Running… (1m 5s · timeout 10m)",
+                "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+                *stable_footers,
+            ],
+            [
+                "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+                "  Bash(same-command)",
+                "  ⎿ Running… (1m 6s · timeout 10m)",
+                "✶ Forging… (4m 24s · ↓ 6.3k tokens)",
+                *stable_footers,
+            ],
+            [
+                "✶ Forging… (4m 24s · ↓ 6.3k tokens)",
+                "  Bash(same-command)",
+                "  ⎿ Running… (1m 7s · timeout 10m)",
+                "✻ Forging… (4m 25s · ↓ 6.4k tokens)",
+                *stable_footers,
+            ],
+        ]
+        provider = ClaudeCodeProvider("t1", "session", "window")
+        screen = MagicMock()
+        sm = StatusMonitor()
+        sm._screens["t1"] = (screen, MagicMock())
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+
+        for frame in frames:
+            screen.display = frame
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        mock_bus.publish.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_same_row_prose_growth_is_not_dynamic_liveness(self, mock_bus):
+        """Only parsed spinner/elapsed/token fields may change the fingerprint."""
+        first_frame = [
+            "● Running the final gate now.",
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+        ]
+        prose_growth = [
+            "● Running the final gate now.",
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens) all checks passed",
+        ]
+        provider = ClaudeCodeProvider("t1", "session", "window")
+        screen = MagicMock()
+        sm = StatusMonitor()
+        sm._screens["t1"] = (screen, MagicMock())
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+
+        screen.display = first_frame
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+        screen.display = prose_growth
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        mock_bus.publish.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_different_tool_context_on_same_row_remains_latched(self, mock_bus):
+        """Two commands sharing a row and timeout are different candidates."""
+        first_command = [
+            "● Running the final gate now.",
+            "  Bash(first-command)",
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+        ]
+        second_command = [
+            "● Running the final gate now.",
+            "  Bash(second-command)",
+            "  ⎿ Running… (1m 6s · timeout 10m)",
+            "✶ Forging… (4m 24s · ↓ 6.3k tokens)",
+        ]
+        provider = ClaudeCodeProvider("t1", "session", "window")
+        screen = MagicMock()
+        sm = StatusMonitor()
+        sm._screens["t1"] = (screen, MagicMock())
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+
+        screen.display = first_command
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+        screen.display = second_command
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        mock_bus.publish.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_long_common_prefix_tool_suffixes_remain_distinct(self, mock_bus):
+        """The complete nearest Bash row participates in candidate identity."""
+        common_prefix = "Bash(python -m pytest " + "shared_long_command_prefix_" * 4
+        assert len(common_prefix) > 80
+        frames = [
+            [
+                "● Running the final gate now.",
+                f"  {common_prefix}alpha_test.py)",
+                "  ⎿ Running… (1m 5s · timeout 10m)",
+                "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+            ],
+            [
+                "● Running the final gate now.",
+                f"  {common_prefix}beta_test.py)",
+                "  ⎿ Running… (1m 6s · timeout 10m)",
+                "✶ Forging… (4m 24s · ↓ 6.3k tokens)",
+            ],
+            [
+                "● Running the final gate now.",
+                f"  {common_prefix}gamma_test.py)",
+                "  ⎿ Running… (1m 7s · timeout 10m)",
+                "✻ Forging… (4m 25s · ↓ 6.4k tokens)",
+            ],
+        ]
+        provider = ClaudeCodeProvider("t1", "session", "window")
+        screen = MagicMock()
+        sm = StatusMonitor()
+        sm._screens["t1"] = (screen, MagicMock())
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+
+        for frame in frames:
+            screen.display = frame
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        mock_bus.publish.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_status_and_temporal_sample_share_one_screen_snapshot(self, mock_bus):
+        first_frame = [
+            "● Running the final gate now.",
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+        ]
+        second_frame = [
+            "● Running the final gate now.",
+            "  ⎿ Running… (1m 6s · timeout 10m)",
+            "✶ Forging… (4m 24s · ↓ 6.3k tokens)",
+        ]
+        third_frame = [
+            "● Running the final gate now.",
+            "  ⎿ Running… (1m 7s · timeout 10m)",
+            "✻ Forging… (4m 25s · ↓ 6.4k tokens)",
+        ]
+
+        class AdvancingScreen:
+            def __init__(self):
+                self.reads = 0
+
+            @property
+            def display(self):
+                frame = (first_frame, second_frame, third_frame)[min(self.reads, 2)]
+                self.reads += 1
+                return frame
+
+        screen = AdvancingScreen()
+        provider = ClaudeCodeProvider("t1", "session", "window")
+        sm = StatusMonitor()
+        sm._screens["t1"] = (screen, MagicMock())
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+        assert screen.reads == 1
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+        assert screen.reads == 2
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+        assert screen.reads == 3
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        mock_bus.publish.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_changing_processing_samples_never_reopen_protected_states(self, mock_bus):
+        """Reviewer HIGH-3: prompts and errors require explicit resolution."""
+        screen = MagicMock()
+        provider = ClaudeCodeProvider("t1", "session", "window")
+
+        for protected_status in (
+            TerminalStatus.WAITING_USER_ANSWER,
+            TerminalStatus.ERROR,
+        ):
+            mock_bus.reset_mock()
+            sm = StatusMonitor()
+            sm._screens["t1"] = (screen, MagicMock())
+            sm._last_status["t1"] = protected_status
+
+            screen.display = [
+                "● Running the final gate now.",
+                "  ⎿ Running… (1m 5s · timeout 10m)",
+                "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+            ]
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+            screen.display = [
+                "● Running the final gate now.",
+                "  ⎿ Running… (1m 6s · timeout 10m)",
+                "✶ Forging… (4m 24s · ↓ 6.3k tokens)",
+            ]
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+            screen.display = [
+                "● Running the final gate now.",
+                "  ⎿ Running… (1m 7s · timeout 10m)",
+                "✻ Forging… (4m 25s · ↓ 6.4k tokens)",
+            ]
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+            assert sm._last_status["t1"] == protected_status
+            mock_bus.publish.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_single_processing_candidate_remains_latched(self, mock_bus):
+        screen = MagicMock()
+        screen.display = [
+            "● Running the final gate now.",
+            "  ⎿ Running… (1m 5s · timeout 10m)",
+            "✢ Forging… (4m 23s · ↓ 6.2k tokens)",
+        ]
+        provider = MagicMock()
+        provider.get_status_from_screen.return_value = TerminalStatus.PROCESSING
+        provider.current_turn_processing_sample.return_value = (
+            "running-tool:timeout 10m:row=1",
+            (
+                ("running_elapsed", "1m 5s"),
+                ("spinner_glyph", "✢"),
+                ("spinner_elapsed", "4m 23s"),
+                ("token_count", "↓6.2k"),
+            ),
+        )
+        sm = StatusMonitor()
+        sm._screens["t1"] = (screen, MagicMock())
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        mock_bus.publish.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_dynamic_key_addition_resets_change_streak(self, mock_bus):
+        screen = MagicMock()
+        screen.display = ["  ⎿ Running…", "✢ Forging…"]
+        provider = MagicMock()
+        provider.get_status_from_screen.return_value = TerminalStatus.PROCESSING
+        provider.current_turn_processing_sample.side_effect = [
+            (
+                "same-candidate",
+                (
+                    ("running_elapsed", "1m 5s"),
+                    ("spinner_glyph", "✢"),
+                    ("spinner_elapsed", "4m 23s"),
+                ),
+            ),
+            (
+                "same-candidate",
+                (
+                    ("running_elapsed", "1m 6s"),
+                    ("spinner_glyph", "✶"),
+                    ("spinner_elapsed", "4m 24s"),
+                    ("token_count", "↓6.3k"),
+                ),
+            ),
+            (
+                "same-candidate",
+                (
+                    ("running_elapsed", "1m 7s"),
+                    ("spinner_glyph", "✻"),
+                    ("spinner_elapsed", "4m 25s"),
+                    ("token_count", "↓6.4k"),
+                ),
+            ),
+        ]
+        sm = StatusMonitor()
+        sm._screens["t1"] = (screen, MagicMock())
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+
+        for _ in range(3):
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        mock_bus.publish.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_elapsed_changes_without_spinner_cycle_remain_latched(self, mock_bus):
+        provider = ClaudeCodeProvider("t1", "session", "window")
+        screen = MagicMock()
+        sm = StatusMonitor()
+        sm._screens["t1"] = (screen, MagicMock())
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+
+        for running_elapsed, spinner_elapsed, tokens in (
+            ("1m 5s", "4m 23s", "6.2k"),
+            ("1m 6s", "4m 24s", "6.3k"),
+            ("1m 7s", "4m 25s", "6.4k"),
+        ):
+            screen.display = [
+                "● Running the final gate now.",
+                f"  ⎿ Running… ({running_elapsed} · timeout 10m)",
+                f"✢ Forging… ({spinner_elapsed} · ↓ {tokens} tokens)",
+            ]
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        mock_bus.publish.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_temporal_candidate_resets_on_state_generation_and_cleanup_edges(self, mock_bus):
+        sample = (
+            0,
+            "running-tool:timeout 10m:row=1",
+            ("running_elapsed", "spinner_glyph", "spinner_elapsed", "token_count"),
+            ("1m 5s", "✢", "4m 23s", "↓6.2k"),
+            1,
+            True,
+        )
+        sm = StatusMonitor()
+
+        sm._ready_processing_samples["t1"] = sample
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._apply_detection("t1", TerminalStatus.COMPLETED)
+        assert "t1" not in sm._ready_processing_samples
+
+        sm._ready_processing_samples["t1"] = sample
+        sm._last_status["t1"] = TerminalStatus.IDLE
+        sm._apply_detection("t1", TerminalStatus.WAITING_USER_ANSWER)
+        assert "t1" not in sm._ready_processing_samples
+
+        sm._ready_processing_samples["t1"] = sample
+        sm.notify_input_sent("t1")
+        assert "t1" not in sm._ready_processing_samples
+
+        sm._ready_processing_samples["t1"] = sample
+        sm.clear_terminal("t1")
+        assert "t1" not in sm._ready_processing_samples
+
+        sm._ready_processing_samples["t1"] = sample
+        sm.reset_buffer("t1")
+        assert "t1" not in sm._ready_processing_samples
 
 
 class _SequencedMonitor:

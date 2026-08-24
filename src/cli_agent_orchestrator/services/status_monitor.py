@@ -7,7 +7,7 @@ Publisher: terminal.{id}.status
 import asyncio
 import logging
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -79,7 +79,17 @@ class StatusMonitor:
         # on two edges only — rising (output resumed) and quiescence (output
         # stopped for PYTE_QUIESCENCE_DELAY_S) — never mid-burst, which is what
         # keeps status flap-free.
-        self._screens: Dict[str, Tuple[object, object]] = {}
+        self._screens: Dict[str, Tuple[Any, Any]] = {}
+        # One candidate streak per ready-latched terminal.  Claude's TUI can
+        # repaint live tool chrome after briefly drawing a ready composer, but
+        # the same rows can also appear as quoted response text.  A later screen
+        # sample must keep the candidate identity and fixed dynamic-key schema.
+        # Three observations with two consecutive changes, including a spinner
+        # glyph change, are required before the ready latch may reopen.
+        self._ready_processing_samples: Dict[
+            str,
+            Tuple[int, str, Tuple[str, ...], Tuple[str, ...], int, bool],
+        ] = {}
         self._bursting: Dict[str, bool] = {}
         # Pending quiescence-detect timer handle per terminal (loop.call_later).
         self._quiesce_handle: Dict[str, asyncio.TimerHandle] = {}
@@ -171,6 +181,7 @@ class StatusMonitor:
         terminal_id: str,
         detected: TerminalStatus,
         generation: Optional[int] = None,
+        confirmed_processing: bool = False,
     ) -> None:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
@@ -194,6 +205,8 @@ class StatusMonitor:
                 )
                 return
             last = self._last_status.get(terminal_id)
+            if detected in _STICKY_READY_STATUSES:
+                self._ready_processing_samples.pop(terminal_id, None)
 
             # UNKNOWN is "no signal", not a state: never let it overwrite a known
             # status. Mid-turn the screen can momentarily show neither a spinner
@@ -219,9 +232,19 @@ class StatusMonitor:
 
             armed = self._allow_processing_revert.get(terminal_id, False)
             if not armed:
-                if last in _STICKY_READY_STATUSES and detected in (
-                    TerminalStatus.PROCESSING,
-                    TerminalStatus.UNKNOWN,
+                confirmed_ready_processing = (
+                    detected == TerminalStatus.PROCESSING
+                    and confirmed_processing
+                    and last in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+                )
+                if (
+                    last in _STICKY_READY_STATUSES
+                    and detected
+                    in (
+                        TerminalStatus.PROCESSING,
+                        TerminalStatus.UNKNOWN,
+                    )
+                    and not confirmed_ready_processing
                 ):
                     return
                 if last == TerminalStatus.COMPLETED and detected == TerminalStatus.IDLE:
@@ -233,8 +256,11 @@ class StatusMonitor:
             self._last_status[terminal_id] = detected
             if detected == TerminalStatus.PROCESSING:
                 self._allow_processing_revert[terminal_id] = False
-            elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:
-                self._allow_processing_revert[terminal_id] = False
+                self._ready_processing_samples.pop(terminal_id, None)
+            elif detected in _STICKY_READY_STATUSES:
+                if last not in _STICKY_READY_STATUSES:
+                    self._allow_processing_revert[terminal_id] = False
+                self._ready_processing_samples.pop(terminal_id, None)
 
         # Publish outside the lock — subscribers must never be able to
         # re-enter StatusMonitor while the latch state is mid-update.
@@ -259,8 +285,8 @@ class StatusMonitor:
             self._screens[terminal_id] = scr
         scr[1].feed(chunk)
 
-    def _detect_screen(self, terminal_id: str, provider) -> TerminalStatus:
-        """Detect status from the terminal's composited pyte screen."""
+    def _capture_screen_snapshot(self, terminal_id: str) -> Tuple[List[str], Optional[str]]:
+        """Capture one immutable viewport, or the raw fallback after a render error."""
         fallback_buffer: Optional[str] = None
         with self._lock:
             scr = self._screens.get(terminal_id)
@@ -277,23 +303,174 @@ class StatusMonitor:
                 )
                 fallback_buffer = buffer
                 lines = []
+        return lines, fallback_buffer
+
+    def _detect_screen(
+        self,
+        terminal_id: str,
+        provider,
+        snapshot: Optional[Tuple[List[str], Optional[str]]] = None,
+    ) -> TerminalStatus:
+        """Detect status from one composited pyte-screen snapshot."""
+        lines, fallback_buffer = snapshot or self._capture_screen_snapshot(terminal_id)
         if fallback_buffer is not None:
             if provider is None:
                 return TerminalStatus.UNKNOWN
             try:
-                return provider.get_status(fallback_buffer)
+                return cast(TerminalStatus, provider.get_status(fallback_buffer))
             except Exception:
                 logger.exception("Error detecting fallback status for %s", terminal_id)
                 return TerminalStatus.UNKNOWN
         if not lines or provider is None:
             return TerminalStatus.UNKNOWN
         try:
-            return provider.get_status_from_screen(lines)
+            return cast(TerminalStatus, provider.get_status_from_screen(lines))
         except Exception:
             # Full traceback: screen detectors are new and can trip on
             # unexpected TUI frames; the stack makes such regressions debuggable.
             logger.exception(f"Error detecting screen status for {terminal_id}")
             return TerminalStatus.UNKNOWN
+
+    def _screen_confirms_processing(
+        self,
+        terminal_id: str,
+        provider,
+        detected: TerminalStatus,
+        generation: Optional[int],
+        lines: List[str],
+    ) -> bool:
+        """Require a complete fixed schema and two successive live changes."""
+        with self._lock:
+            current_generation = self._input_generation.get(terminal_id, 0)
+            if generation is not None and generation != current_generation:
+                return False
+            last = self._last_status.get(terminal_id)
+            armed = self._allow_processing_revert.get(terminal_id, False)
+            if (
+                detected != TerminalStatus.PROCESSING
+                or last not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+                or armed
+            ):
+                self._ready_processing_samples.pop(terminal_id, None)
+                return False
+        if not lines or provider is None:
+            with self._lock:
+                self._ready_processing_samples.pop(terminal_id, None)
+            return False
+        try:
+            sample = provider.current_turn_processing_sample("\n".join(lines))
+        except Exception:
+            logger.exception("Error sampling live processing for %s", terminal_id)
+            with self._lock:
+                self._ready_processing_samples.pop(terminal_id, None)
+            return False
+        if not isinstance(sample, tuple) or len(sample) != 2:
+            with self._lock:
+                self._ready_processing_samples.pop(terminal_id, None)
+            return False
+
+        identity, keyed_values = sample
+        valid_keyed_values = (
+            isinstance(identity, str)
+            and bool(identity)
+            and isinstance(keyed_values, tuple)
+            and bool(keyed_values)
+            and all(
+                isinstance(pair, tuple)
+                and len(pair) == 2
+                and all(isinstance(part, str) and part for part in pair)
+                for pair in keyed_values
+            )
+        )
+        if not valid_keyed_values:
+            with self._lock:
+                self._ready_processing_samples.pop(terminal_id, None)
+            return False
+
+        keys = tuple(pair[0] for pair in keyed_values)
+        values = tuple(pair[1] for pair in keyed_values)
+        if len(set(keys)) != len(keys) or "spinner_glyph" not in keys:
+            with self._lock:
+                self._ready_processing_samples.pop(terminal_id, None)
+            return False
+
+        with self._lock:
+            current_generation = self._input_generation.get(terminal_id, 0)
+            if generation is not None and generation != current_generation:
+                return False
+            if self._last_status.get(terminal_id) not in (
+                TerminalStatus.IDLE,
+                TerminalStatus.COMPLETED,
+            ) or self._allow_processing_revert.get(terminal_id, False):
+                self._ready_processing_samples.pop(terminal_id, None)
+                return False
+            previous = self._ready_processing_samples.get(terminal_id)
+            if (
+                previous is None
+                or previous[0] != current_generation
+                or previous[1] != identity
+                or previous[2] != keys
+            ):
+                self._ready_processing_samples[terminal_id] = (
+                    current_generation,
+                    identity,
+                    keys,
+                    values,
+                    0,
+                    False,
+                )
+                return False
+
+            if previous[3] == values:
+                self._ready_processing_samples[terminal_id] = (
+                    current_generation,
+                    identity,
+                    keys,
+                    values,
+                    0,
+                    False,
+                )
+                return False
+
+            spinner_index = keys.index("spinner_glyph")
+            change_streak = previous[4] + 1
+            spinner_changed = previous[5] or previous[3][spinner_index] != values[spinner_index]
+            self._ready_processing_samples[terminal_id] = (
+                current_generation,
+                identity,
+                keys,
+                values,
+                change_streak,
+                spinner_changed,
+            )
+            return change_streak >= 2 and spinner_changed
+
+    def _detect_and_apply_screen(
+        self,
+        terminal_id: str,
+        provider,
+        generation: Optional[int] = None,
+    ) -> TerminalStatus:
+        """Detect a rendered status and apply provider-confirmed live work."""
+        if generation is None:
+            with self._lock:
+                generation = self._input_generation.get(terminal_id, 0)
+        snapshot = self._capture_screen_snapshot(terminal_id)
+        detected = self._detect_screen(terminal_id, provider, snapshot)
+        confirmed = self._screen_confirms_processing(
+            terminal_id,
+            provider,
+            detected,
+            generation,
+            snapshot[0],
+        )
+        self._apply_detection(
+            terminal_id,
+            detected,
+            generation,
+            confirmed_processing=confirmed,
+        )
+        return detected
 
     def _schedule_screen_detection(self, terminal_id: str, provider) -> None:
         """Edge-debounce detection on the pyte screen.
@@ -309,7 +486,7 @@ class StatusMonitor:
         if loop is None:
             # No event loop (unit tests / offline replay): detect immediately
             # on the current screen — deterministic, no timing.
-            self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+            self._detect_and_apply_screen(terminal_id, provider)
             return
 
         with self._lock:
@@ -317,25 +494,16 @@ class StatusMonitor:
             self._bursting[terminal_id] = True
             handle = self._quiesce_handle.pop(terminal_id, None)
             last_status = self._last_status.get(terminal_id)
-            armed = self._allow_processing_revert.get(terminal_id, False)
             generation = self._input_generation.get(terminal_id, 0)
         self._cancel_quiesce_handle(handle)
 
         # The first frame after input can still be the echoed idle composer.
-        # While a ready status is explicitly armed by notify_input_sent(), keep
-        # sampling subsequent rendered frames until PROCESSING is observed.
-        # Codex continuously redraws its spinner, so waiting for quiescence can
-        # otherwise leave the cache stuck at IDLE for the entire turn.
-        if (
-            not was_bursting
-            or last_status is None
-            or (last_status in _STICKY_READY_STATUSES and armed)
-        ):
-            self._apply_detection(
-                terminal_id,
-                self._detect_screen(terminal_id, provider),
-                generation,
-            )
+        # Keep sampling while a ready state is latched: normally the dispatch
+        # arm admits the next PROCESSING edge, while a provider-confirmed live
+        # marker admits same-turn tool work that starts after an interim ready
+        # repaint.  Unconfirmed redraws remain blocked by _apply_detection.
+        if not was_bursting or last_status is None or last_status in _STICKY_READY_STATUSES:
+            self._detect_and_apply_screen(terminal_id, provider, generation)
 
         self._arm_quiesce_timer(
             loop,
@@ -361,16 +529,16 @@ class StatusMonitor:
             self._quiesce_handle.pop(terminal_id, None)
 
         async def _detect_and_apply() -> None:
-            detected = await asyncio.to_thread(self._detect_screen, terminal_id, provider)
-            self._apply_detection(terminal_id, detected, generation)
+            await asyncio.to_thread(
+                self._detect_and_apply_screen,
+                terminal_id,
+                provider,
+                generation,
+            )
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            self._apply_detection(
-                terminal_id,
-                self._detect_screen(terminal_id, provider),
-                generation,
-            )
+            self._detect_and_apply_screen(terminal_id, provider, generation)
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
@@ -533,6 +701,7 @@ class StatusMonitor:
         with self._lock:
             self._input_generation[terminal_id] = self._input_generation.get(terminal_id, 0) + 1
             self._allow_processing_revert[terminal_id] = True
+            self._ready_processing_samples.pop(terminal_id, None)
 
     def is_input_armed(self, terminal_id: str) -> bool:
         """Return whether a newly-sent input still awaits observed processing.
@@ -590,6 +759,7 @@ class StatusMonitor:
             self._allow_processing_revert.pop(terminal_id, None)
             self._input_generation.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
+            self._ready_processing_samples.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
@@ -611,6 +781,7 @@ class StatusMonitor:
             # Drop the rendered screen too so the relaunched CLI mode is
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)
+            self._ready_processing_samples.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)

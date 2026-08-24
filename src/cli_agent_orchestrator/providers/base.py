@@ -23,7 +23,7 @@ import logging
 import re
 import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -291,6 +291,22 @@ class BaseProvider(ABC):
         """
 
         return False
+
+    def current_turn_processing_sample(
+        self, output: str
+    ) -> Optional[Tuple[str, Tuple[Tuple[str, str], ...]]]:
+        """Return one candidate ``(identity, keyed_dynamic_values)``.
+
+        The conservative default is None.  A provider may expose a narrowly
+        anchored piece of live TUI chrome here, but one rendered frame is only a
+        candidate: StatusMonitor requires three post-ready samples with the same
+        identity and fixed key schema, plus two consecutive value changes.  A
+        provider must return None until every required dynamic field is already
+        present.  Only IDLE/COMPLETED may be reopened; prompts and errors remain
+        protected.
+        """
+
+        return None
 
     def mark_input_received(self) -> None:
         """Notify the provider that external input was sent to the terminal.
