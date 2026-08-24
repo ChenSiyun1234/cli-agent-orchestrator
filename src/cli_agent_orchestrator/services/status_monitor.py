@@ -579,10 +579,32 @@ class StatusMonitor:
                 buffer = ""
 
         if cached == TerminalStatus.PROCESSING and buffer:
-            fresh = self._detect_status(terminal_id, buffer)
+            # Keep the poll-time refresh on the SAME detection path that
+            # produced the cached status.  In rendered-screen mode the raw
+            # pipe-pane stream still contains stale completion markers and
+            # cursor-redraw fragments; asking the raw detector to overrule a
+            # live composited spinner can therefore turn PROCESSING into
+            # COMPLETED mid-turn.  run_step then tears the worker down while it
+            # is still working.  Screen-enabled providers must refresh from
+            # their composited viewport instead.
+            try:
+                provider = provider_manager.get_provider(terminal_id)
+            except Exception:
+                provider = None
+            use_screen = (
+                CAO_PYTE_STATUS
+                and provider is not None
+                and getattr(provider, "supports_screen_detection", False)
+            )
+            fresh = (
+                self._detect_screen(terminal_id, provider)
+                if use_screen
+                else self._detect_status(terminal_id, buffer)
+            )
             logger.debug(
                 f"get_status [{terminal_id}]: cached=PROCESSING, "
-                f"fresh={fresh.value}, buffer_len={len(buffer)}"
+                f"fresh={fresh.value}, detector={'screen' if use_screen else 'raw'}, "
+                f"buffer_len={len(buffer)}"
             )
             if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
                 self._apply_detection(terminal_id, fresh)

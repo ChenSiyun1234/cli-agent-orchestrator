@@ -88,6 +88,35 @@ class TestGetStatusEventInbox:
 class TestScreenDetection:
     """Rendered-screen detection should fail soft and keep monitoring alive."""
 
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_processing_poll_refresh_stays_on_screen_path(
+        self, mock_get_backend, mock_pm
+    ):
+        """A raw redraw stream must not overrule a live rendered spinner.
+
+        This is the exact run_step failure mode observed with Claude Code: the
+        screen detector had correctly latched PROCESSING for ``· Kneading…``,
+        while the raw buffer still contained an earlier completion marker and
+        returned COMPLETED.  A poll-time refresh used to trust that raw result
+        and tear down the worker mid-turn.
+        """
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "raw redraw with stale completion marker"
+        sm._detect_screen = MagicMock(return_value=TerminalStatus.PROCESSING)
+        sm._detect_status = MagicMock(return_value=TerminalStatus.COMPLETED)
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        sm._detect_screen.assert_called_once_with("t1", provider)
+        sm._detect_status.assert_not_called()
+
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_render_error_falls_back_to_raw_buffer_detection(self, mock_pm):
         class BrokenScreen:
