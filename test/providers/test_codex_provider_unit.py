@@ -2587,6 +2587,53 @@ class TestCodexProviderTrustPrompt:
         assert TerminalStatus.IDLE in target_status_arg
         assert TerminalStatus.COMPLETED in target_status_arg
 
+    @pytest.mark.asyncio
+    @patch.object(CodexProvider, "_handle_trust_prompt", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_initialize_accepts_processing_after_successful_dispatch(
+        self, mock_backend, mock_wait_shell, mock_wait_status, mock_handle
+    ):
+        """A task dispatched after polling starts may outrun the ready frame."""
+        mock_wait_shell.return_value = True
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+
+        async def observe_late_dispatch(_terminal_id, statuses, **_kwargs):
+            # The same target object first rejects plain startup PROCESSING,
+            # then admits it after send_input's existing successful-delivery
+            # callback arrives while the wait is already in progress.
+            assert TerminalStatus.PROCESSING not in statuses
+            provider.mark_input_received()
+            return TerminalStatus.PROCESSING in statuses
+
+        mock_wait_status.side_effect = observe_late_dispatch
+
+        assert await provider.initialize() is True
+        assert provider._initialized is True
+        assert provider._task_dispatched is True
+
+    @pytest.mark.asyncio
+    @patch.object(CodexProvider, "_handle_trust_prompt", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_initialize_rejects_plain_startup_processing(
+        self, mock_backend, mock_wait_shell, mock_wait_status, mock_handle
+    ):
+        """Static launch/MCP activity alone must not make a hung startup ready."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.side_effect = (
+            lambda _terminal_id, statuses, **_kwargs: TerminalStatus.PROCESSING in statuses
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+
+        with pytest.raises(TimeoutError, match="Codex initialization timed out"):
+            await provider.initialize()
+
+        assert provider._initialized is False
+        assert provider._task_dispatched is False
+
     def test_backend_registry_is_clean_at_test_start(self):
         """Regression for #522: autouse fixture resets the backend singleton."""
         from cli_agent_orchestrator.backends import registry

@@ -791,6 +791,14 @@ class CodexProvider(BaseProvider):
         # Handle workspace trust prompt if it appears (new/untrusted directories)
         await self._handle_trust_prompt(timeout=20.0)
 
+        # PROCESSING is a successful initialization outcome only after a real
+        # input dispatch.  A deferred ASSIGN can be submitted during a brief
+        # ready frame before this coroutine observes it; send_input() then calls
+        # mark_input_received(), setting _task_dispatched after transport
+        # succeeds.  In that race PROCESSING proves the worker is executing its
+        # task.  Plain Codex/MCP startup also reports PROCESSING, so admitting it
+        # without the dispatch edge would hide a hung launch.
+        #
         # WAITING_USER_ANSWER is included here specifically for the first-run login/auth
         # menu (see LOGIN_MENU_PATTERN's own comment) — an account with no credentials
         # configured yet is a real, expected state at this exact point (trust/update
@@ -807,13 +815,32 @@ class CodexProvider(BaseProvider):
         # path can't let an assign/handoff paste the orchestrated task into the live login
         # menu -- the same composition hazard PR #539's review flagged for ClaudeCodeProvider's
         # own choice-prompt widening, fixed here the same way rather than left open.
+        provider = self
+
+        class _InitializationStatuses(set[TerminalStatus]):
+            """Evaluate the dispatch-gated PROCESSING edge on every poll."""
+
+            def __contains__(self, status: object) -> bool:
+                if status == TerminalStatus.PROCESSING and not provider._task_dispatched:
+                    return False
+                return super().__contains__(status)
+
+        initialized_statuses = _InitializationStatuses(
+            {
+                TerminalStatus.IDLE,
+                TerminalStatus.COMPLETED,
+                TerminalStatus.PROCESSING,
+                TerminalStatus.WAITING_USER_ANSWER,
+            }
+        )
+
         if not await wait_until_status(
             self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
-            timeout=float(get_server_settings()["provider_init_timeout"]),
+            initialized_statuses,
+            timeout=float(init_timeout),
             polling_interval=1.0,
         ):
-            raise TimeoutError("Codex initialization timed out after 60 seconds")
+            raise TimeoutError(f"Codex initialization timed out after {init_timeout} seconds")
 
         self._initialized = True
         return True
