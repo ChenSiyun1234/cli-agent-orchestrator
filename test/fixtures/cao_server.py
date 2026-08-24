@@ -71,7 +71,10 @@ import requests
 # ---------------------------------------------------------------------------
 
 _HEALTH_POLL_INTERVAL = 0.05
-_HEALTH_TIMEOUT_DEFAULT = 8.0
+# Cold imports from a WSL-mounted Windows virtualenv can legitimately exceed
+# eight seconds even though the server completes startup normally.  Keep this
+# bounded for fixture cleanup, but avoid classifying a slow cold start as dead.
+_HEALTH_TIMEOUT_DEFAULT = 30.0
 _STOP_GRACE_SECONDS = 5.0
 _LOG_TAIL_LINES = 80
 
@@ -177,8 +180,8 @@ def _subprocess_env(
 
     Starts from a copy of the parent env, deletes any leaked Auth0 vars (so a
     developer's exported ``AUTH0_DOMAIN`` doesn't accidentally enable auth in
-    the no-auth variant), then applies the standard test overrides plus any
-    ``extra`` knobs.
+    the no-auth variant), then pins both HOME and CAO_HOME_DIR to this fixture's
+    isolated tree before applying any explicit ``extra`` knobs.
     """
     env = os.environ.copy()
     for leaked in ("AUTH0_DOMAIN", "AUTH0_AUDIENCE", "CAO_AUTH_JWKS_URI"):
@@ -187,6 +190,7 @@ def _subprocess_env(
     env.update(
         {
             "HOME": str(home_dir),
+            "CAO_HOME_DIR": str(home_dir / ".aws" / "cli-agent-orchestrator"),
             "CAO_API_HOST": "127.0.0.1",
             "CAO_API_PORT": str(port),
             "CAO_A2A_DISABLED": "true",

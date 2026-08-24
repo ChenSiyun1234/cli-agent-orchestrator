@@ -42,6 +42,20 @@ class TestRunStepEndpoint:
         assert kwargs["agent"] == "developer"
         assert kwargs["prompt"] == "do it"
         assert kwargs["model"] is None
+        assert kwargs["reasoning_effort"] is None
+        assert kwargs["timeout"] is None
+
+    def test_explicit_timeout_is_still_supported(self, client):
+        result = AgentStepResult(
+            terminal_id="abc12345",
+            last_message="all done",
+            status=TerminalStatus.COMPLETED,
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(timeout=42))
+
+        assert resp.status_code == 200
+        assert m_run.await_args.kwargs["timeout"] == 42
 
     def test_model_forwarded_to_substrate(self, client):
         result = AgentStepResult(
@@ -52,6 +66,24 @@ class TestRunStepEndpoint:
 
         assert resp.status_code == 200
         assert m_run.await_args.kwargs["model"] == "fable-5"
+
+    def test_reasoning_effort_forwarded_to_substrate(self, client):
+        result = AgentStepResult(
+            terminal_id="abc12345", last_message="all done", status=TerminalStatus.COMPLETED
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(reasoning_effort="xhigh"))
+
+        assert resp.status_code == 200
+        assert m_run.await_args.kwargs["reasoning_effort"] == "xhigh"
+
+    @pytest.mark.parametrize("bad_effort", ["ultra", "maximum", "HIGH", "high;rm"])
+    def test_invalid_reasoning_effort_returns_422(self, client, bad_effort):
+        with patch(_RUN_STEP, new=AsyncMock()) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(reasoning_effort=bad_effort))
+
+        assert resp.status_code == 422
+        m_run.assert_not_awaited()
 
     @pytest.mark.parametrize(
         "bad_model",

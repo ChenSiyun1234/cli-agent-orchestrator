@@ -219,8 +219,8 @@ class TestWorkflowCancel:
             out = asyncio.run(workflow_cancel("run1"))
         assert out["ok"] is True
         assert out["run_id"] == "run1"
-        # cancel is a quick write — it correctly keeps the flat MCP_REQUEST_TIMEOUT.
-        assert post.call_args.kwargs["timeout"] == MCP_REQUEST_TIMEOUT
+        # cancel is a quick write and uses the configured per-call timeout.
+        assert post.call_args.kwargs["timeout"] == _mcp_timeout()
 
     def test_conflict_envelope_no_raise(self):
         with patch(

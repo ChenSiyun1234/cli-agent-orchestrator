@@ -23,6 +23,7 @@ from test.fixtures.cao_server import (
     _pick_free_port,
     _session_rsa_keys,
     _start_cao_server,
+    _subprocess_env,
 )
 
 import pytest
@@ -56,6 +57,17 @@ def test_home_isolated(cao_server: CaoServer) -> None:
     assert cao_root.exists(), f"subprocess never wrote anything under {cao_root}"
     # The logs subdir is created during lifespan setup_logging().
     assert (cao_root / "logs").exists()
+
+
+def test_subprocess_home_ignores_parent_cao_home_override(tmp_path, monkeypatch) -> None:
+    """A test runner's CAO_HOME_DIR cannot redirect the managed subprocess."""
+    monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path / "leaked-parent-state"))
+    home = tmp_path / "managed-home"
+
+    env = _subprocess_env(home, 12345)
+
+    assert env["HOME"] == str(home)
+    assert env["CAO_HOME_DIR"] == str(home / ".aws" / "cli-agent-orchestrator")
 
 
 def test_log_file_populated(cao_server: CaoServer) -> None:

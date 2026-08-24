@@ -59,6 +59,7 @@ from cli_agent_orchestrator.constants import (
     MODEL_ID_MAX_LEN,
     MODEL_ID_RE,
     OTEL_SERVICE_NAME,
+    REASONING_EFFORT_LEVELS,
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
@@ -344,6 +345,14 @@ def _validate_model_id(value: str) -> None:
         raise ValueError(f"model {value!r} is invalid (must match {MODEL_ID_RE!r})")
 
 
+def _validate_reasoning_effort(value: str) -> None:
+    """Validate the provider-native per-launch reasoning effort."""
+
+    if value not in REASONING_EFFORT_LEVELS:
+        allowed = ", ".join(sorted(REASONING_EFFORT_LEVELS))
+        raise ValueError(f"reasoning_effort must be one of: {allowed}")
+
+
 class UpdateGroupBody(BaseModel):
     """Request body for ``PATCH /terminals/{id}/group`` (#432).
 
@@ -397,7 +406,14 @@ class RunStepRequest(BaseModel):
         default=True,
         description="Delete the created terminal after the step (ignored when reusing)",
     )
-    timeout: float = Field(default=600.0, description="Max seconds to wait for completion", gt=0)
+    timeout: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional max seconds to wait for completion. Omit to wait until completion, "
+            "explicit cancellation, or a real terminal error."
+        ),
+        gt=0,
+    )
     working_directory: Optional[str] = Field(
         default=None, description="Working directory for a freshly created terminal"
     )
@@ -432,6 +448,13 @@ class RunStepRequest(BaseModel):
             "(ignored when reusing a terminal), applied ahead of the agent "
             "profile's own static model field. Lets a caller pin a specific "
             "model for one worker without a dedicated agent profile."
+        ),
+    )
+    reasoning_effort: Optional[str] = Field(
+        default=None,
+        description=(
+            "Explicit provider-native reasoning effort for a freshly created "
+            "Codex or Claude Code terminal. Ignored when reusing a terminal."
         ),
     )
 
@@ -491,6 +514,14 @@ class RunStepRequest(BaseModel):
         if v is None:
             return v
         _validate_model_id(v)
+        return v
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def validate_reasoning_effort(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        _validate_reasoning_effort(v)
         return v
 
     @model_validator(mode="after")
@@ -1104,6 +1135,13 @@ async def lifespan(app: FastAPI):
     log_writer_task = asyncio.create_task(log_writer.run())
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
+
+    # Tmux agents survive an API/tray restart; their process-local FIFO readers,
+    # providers, and status buffers do not.  Let consumers subscribe first, then
+    # reconnect the durable panes before inbox reconciliation can make delivery
+    # decisions from UNKNOWN state.
+    await asyncio.sleep(0)
+    await asyncio.to_thread(terminal_service.restore_persisted_terminal_monitors)
 
     # Start ApprovalBridge when AG-UI surface is enabled
     approval_bridge_task: Optional[asyncio.Task] = None
@@ -2303,7 +2341,11 @@ async def get_memory_settings_endpoint() -> Dict:
         is_memory_enabled,
     )
 
-    return {"enabled": is_memory_enabled(), "learning_enabled": is_learning_enabled()}
+    memory_enabled = is_memory_enabled()
+    return {
+        "enabled": memory_enabled,
+        "learning_enabled": memory_enabled and is_learning_enabled(),
+    }
 
 
 @app.post("/settings/agent-dirs")
@@ -2414,6 +2456,7 @@ async def create_session(
     memory_manager: Optional[str] = None,
     engine: Optional[KiroEngine] = None,
     model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -2470,6 +2513,8 @@ async def create_session(
             validate_tmux_name(effective, "session_name")
         if model is not None:
             _validate_model_id(model)
+        if reasoning_effort is not None:
+            _validate_reasoning_effort(reasoning_effort)
         if initial_message == "":
             raise ValueError("initial_message must not be empty")
         if body and body.initial_message_orchestration_type:
@@ -2499,6 +2544,7 @@ async def create_session(
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
+            reasoning_effort=reasoning_effort,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
         )
@@ -2615,6 +2661,7 @@ async def create_terminal_in_session(
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
     model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     use_worktree: bool = False,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -2652,6 +2699,8 @@ async def create_terminal_in_session(
         validate_tmux_name(session_name, "session_name")
         if model is not None:
             _validate_model_id(model)
+        if reasoning_effort is not None:
+            _validate_reasoning_effort(reasoning_effort)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
@@ -2714,6 +2763,7 @@ async def create_terminal_in_session(
             initial_message_orchestration_type=orch_type,
             engine=engine,
             model=model,
+            reasoning_effort=reasoning_effort,
             use_worktree=use_worktree,
         )
         return result
@@ -3223,6 +3273,7 @@ async def run_step(
             env_vars=body.env_vars,
             on_terminal_created=on_terminal_created,
             model=body.model,
+            reasoning_effort=body.reasoning_effort,
             use_worktree=body.use_worktree,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
@@ -5482,6 +5533,12 @@ async def create_inbox_message_endpoint(
     receiver_id: TerminalId,
     sender_id: str,
     message: str,
+    task_id: Optional[str] = Query(default=None, max_length=200),
+    reply_to_message_id: Optional[int] = Query(default=None, ge=1),
+    review_verdict: Optional[Literal["ACCEPT", "REJECT"]] = Query(default=None),
+    orchestration_type: Optional[Literal["send_message", "handoff", "assign"]] = Query(
+        default=None
+    ),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
@@ -5490,9 +5547,19 @@ async def create_inbox_message_endpoint(
             sender_id,
             receiver_id,
             message,
+            task_id=task_id,
+            reply_to_message_id=reply_to_message_id,
+            review_verdict=review_verdict,
+            orchestration_type=orchestration_type,
         )
     except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        detail = str(e)
+        status_code = (
+            status.HTTP_404_NOT_FOUND
+            if detail.startswith("Terminal") and detail.endswith("not found")
+            else status.HTTP_400_BAD_REQUEST
+        )
+        raise HTTPException(status_code=status_code, detail=detail)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -5512,6 +5579,12 @@ async def create_inbox_message_endpoint(
         "sender_id": inbox_msg.sender_id,
         "receiver_id": inbox_msg.receiver_id,
         "created_at": inbox_msg.created_at.isoformat(),
+        "orchestration_type": (
+            inbox_msg.orchestration_type.value if inbox_msg.orchestration_type else None
+        ),
+        "task_id": inbox_msg.task_id,
+        "reply_to_message_id": inbox_msg.reply_to_message_id,
+        "review_verdict": inbox_msg.review_verdict,
     }
 
 
@@ -5522,6 +5595,10 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    newest_first: bool = Query(
+        default=False,
+        description="Return the newest limited window in chronological order",
+    ),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
@@ -5530,6 +5607,7 @@ async def get_inbox_messages_endpoint(
         terminal_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10, max: 100)
         status_param: Optional filter by message status ('pending', 'delivered', 'failed')
+        newest_first: Select the newest limited window instead of the oldest
 
     Returns:
         List of inbox messages with sender_id, message, created_at, status
@@ -5547,7 +5625,15 @@ async def get_inbox_messages_endpoint(
                 )
 
         # Get messages using existing database function
-        messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+        if newest_first:
+            messages = get_inbox_messages(
+                terminal_id,
+                limit=limit,
+                status=status_filter,
+                newest_first=True,
+            )
+        else:
+            messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
 
         # Convert to response format
         result = []
@@ -5560,6 +5646,15 @@ async def get_inbox_messages_endpoint(
                     "message": msg.message,
                     "status": msg.status.value,
                     "created_at": msg.created_at.isoformat() if msg.created_at else None,
+                    "orchestration_type": (
+                        msg.orchestration_type.value if msg.orchestration_type else None
+                    ),
+                    "task_id": msg.task_id,
+                    "reply_to_message_id": msg.reply_to_message_id,
+                    "delivered_at": msg.delivered_at.isoformat() if msg.delivered_at else None,
+                    "started_at": msg.started_at.isoformat() if msg.started_at else None,
+                    "reviewed_at": msg.reviewed_at.isoformat() if msg.reviewed_at else None,
+                    "review_verdict": msg.review_verdict,
                 }
             )
 

@@ -68,6 +68,10 @@ class StatusMonitor:
         # IDLE/COMPLETED would freeze the terminal forever even when the
         # agent is genuinely processing new work.
         self._allow_processing_revert: Dict[str, bool] = {}
+        # Monotonic dispatch generation.  Async quiescence detection captures
+        # this before leaving the lock and may apply its result only if no newer
+        # input was armed in the meantime.
+        self._input_generation: Dict[str, int] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
         # Per-terminal pyte Screen+Stream that composites the raw byte stream
@@ -162,7 +166,12 @@ class StatusMonitor:
 
         self._schedule_screen_detection(terminal_id, provider)
 
-    def _apply_detection(self, terminal_id: str, detected: TerminalStatus) -> None:
+    def _apply_detection(
+        self,
+        terminal_id: str,
+        detected: TerminalStatus,
+        generation: Optional[int] = None,
+    ) -> None:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
 
@@ -176,6 +185,14 @@ class StatusMonitor:
         paste into a busy agent).
         """
         with self._lock:
+            if generation is not None and generation != self._input_generation.get(terminal_id, 0):
+                logger.debug(
+                    "Ignoring stale status detection for %s (generation %s, current %s)",
+                    terminal_id,
+                    generation,
+                    self._input_generation.get(terminal_id, 0),
+                )
+                return
             last = self._last_status.get(terminal_id)
 
             # UNKNOWN is "no signal", not a state: never let it overwrite a known
@@ -299,14 +316,41 @@ class StatusMonitor:
             was_bursting = self._bursting.get(terminal_id, False)
             self._bursting[terminal_id] = True
             handle = self._quiesce_handle.pop(terminal_id, None)
+            last_status = self._last_status.get(terminal_id)
+            armed = self._allow_processing_revert.get(terminal_id, False)
+            generation = self._input_generation.get(terminal_id, 0)
         self._cancel_quiesce_handle(handle)
 
-        if not was_bursting:
-            self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+        # The first frame after input can still be the echoed idle composer.
+        # While a ready status is explicitly armed by notify_input_sent(), keep
+        # sampling subsequent rendered frames until PROCESSING is observed.
+        # Codex continuously redraws its spinner, so waiting for quiescence can
+        # otherwise leave the cache stuck at IDLE for the entire turn.
+        if (
+            not was_bursting
+            or last_status is None
+            or (last_status in _STICKY_READY_STATUSES and armed)
+        ):
+            self._apply_detection(
+                terminal_id,
+                self._detect_screen(terminal_id, provider),
+                generation,
+            )
 
-        self._arm_quiesce_timer(loop, terminal_id, self._on_screen_quiescent, provider)
+        self._arm_quiesce_timer(
+            loop,
+            terminal_id,
+            self._on_screen_quiescent,
+            provider,
+            generation,
+        )
 
-    def _on_screen_quiescent(self, terminal_id: str, provider) -> None:
+    def _on_screen_quiescent(
+        self,
+        terminal_id: str,
+        provider,
+        generation: Optional[int] = None,
+    ) -> None:
         """Quiescence timer fired: output stopped, so the screen has settled.
 
         Fires on the loop; offload the (potentially blocking) screen detection
@@ -318,11 +362,15 @@ class StatusMonitor:
 
         async def _detect_and_apply() -> None:
             detected = await asyncio.to_thread(self._detect_screen, terminal_id, provider)
-            self._apply_detection(terminal_id, detected)
+            self._apply_detection(terminal_id, detected, generation)
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+            self._apply_detection(
+                terminal_id,
+                self._detect_screen(terminal_id, provider),
+                generation,
+            )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
@@ -355,6 +403,7 @@ class StatusMonitor:
             self._bursting[terminal_id] = True
             handle = self._quiesce_handle.pop(terminal_id, None)
             last_status = self._last_status.get(terminal_id)
+            generation = self._input_generation.get(terminal_id, 0)
         self._cancel_quiesce_handle(handle)
 
         # While terminal is ready/armed, detect on every chunk so the
@@ -362,9 +411,9 @@ class StatusMonitor:
         # delivery by InboxService). Once PROCESSING is observed, debounce.
         if not was_bursting or last_status in _STICKY_READY_STATUSES or last_status is None:
             detected = self._detect_status(terminal_id, buffer)
-            self._apply_detection(terminal_id, detected)
+            self._apply_detection(terminal_id, detected, generation)
 
-        self._arm_quiesce_timer(loop, terminal_id, self._on_raw_quiescent)
+        self._arm_quiesce_timer(loop, terminal_id, self._on_raw_quiescent, generation)
 
     def _arm_quiesce_timer(self, loop, terminal_id: str, callback, *cb_args) -> None:
         """Schedule the quiescence timer on ``loop`` from any thread.
@@ -400,7 +449,11 @@ class StatusMonitor:
             # Loop closed during shutdown — quiescence re-detect is moot.
             pass
 
-    def _on_raw_quiescent(self, terminal_id: str) -> None:
+    def _on_raw_quiescent(
+        self,
+        terminal_id: str,
+        generation: Optional[int] = None,
+    ) -> None:
         """Quiescence timer fired for raw path: re-detect from current buffer.
 
         Fires on the event loop (via call_later), so the blocking
@@ -415,11 +468,15 @@ class StatusMonitor:
 
         async def _detect_and_apply() -> None:
             detected = await asyncio.to_thread(self._detect_status, terminal_id, buffer)
-            self._apply_detection(terminal_id, detected)
+            self._apply_detection(terminal_id, detected, generation)
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            self._apply_detection(
+                terminal_id,
+                self._detect_status(terminal_id, buffer),
+                generation,
+            )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
@@ -474,7 +531,18 @@ class StatusMonitor:
         IDLE/COMPLETED would block the genuine PROCESSING transition.
         """
         with self._lock:
+            self._input_generation[terminal_id] = self._input_generation.get(terminal_id, 0) + 1
             self._allow_processing_revert[terminal_id] = True
+
+    def is_input_armed(self, terminal_id: str) -> bool:
+        """Return whether a newly-sent input still awaits observed processing.
+
+        A terminal may retain the previous turn's ``COMPLETED`` status for a
+        short time after new input is sent. Completion waiters use this latch
+        to distinguish that stale marker from completion of the new turn.
+        """
+        with self._lock:
+            return self._allow_processing_revert.get(terminal_id, False)
 
     def clear_rolling_buffer(self, terminal_id: str) -> None:
         """Clear ONLY the rolling byte buffer for a terminal — preserves
@@ -489,6 +557,18 @@ class StatusMonitor:
         """
         with self._lock:
             self._buffers[terminal_id] = ""
+
+    def seed_terminal_history(self, terminal_id: str, history: str) -> None:
+        """Prime status state from a live pane after a server restart.
+
+        This bypasses the output event bus so historical scrollback is not
+        duplicated in the append-only terminal log.  Future bytes still arrive
+        through the reattached FIFO reader.
+        """
+
+        self.reset_buffer(terminal_id)
+        if history:
+            self._process_chunk(terminal_id, history)
 
     def _detect_status(self, terminal_id: str, buffer: str) -> TerminalStatus:
         """Detect status: provider-specific patterns or UNKNOWN if no provider."""
@@ -508,6 +588,7 @@ class StatusMonitor:
             self._buffers.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
+            self._input_generation.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
@@ -526,6 +607,7 @@ class StatusMonitor:
             self._buffers[terminal_id] = ""
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
+            self._input_generation[terminal_id] = self._input_generation.get(terminal_id, 0) + 1
             # Drop the rendered screen too so the relaunched CLI mode is
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)
@@ -560,25 +642,41 @@ class StatusMonitor:
                     # get_native_status()==None fallback still gets what we have.
                     # provider.get_status may shell out to the herdr CLI — call
                     # it outside the lock.
-                    return provider.get_status(buffer)
+                    fresh = provider.get_status(buffer)
+                    if fresh in {
+                        TerminalStatus.PROCESSING,
+                        TerminalStatus.WAITING_USER_ANSWER,
+                    }:
+                        # Native/event-inbox state is authoritative evidence
+                        # that the just-sent turn was accepted.  This branch does
+                        # not pass through _apply_detection, so consume the arm
+                        # explicitly before completion can arrive.
+                        with self._lock:
+                            self._allow_processing_revert[terminal_id] = False
+                    self._apply_detection(terminal_id, fresh)
+                    return fresh
                 except Exception as e:
                     logger.error(f"Error deriving native status for {terminal_id}: {e}")
                     return TerminalStatus.UNKNOWN
 
         with self._lock:
             cached = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            armed_ready = cached in _STICKY_READY_STATUSES and self._allow_processing_revert.get(
+                terminal_id, False
+            )
+            generation = self._input_generation.get(terminal_id, 0)
             # When cached status is PROCESSING, the debounced detection may be
             # stuck: TUI providers (kiro-cli) can send escape sequences
             # continuously after becoming idle, preventing the 200ms quiescence
             # timer from ever firing. Do a fresh detection from the current
             # buffer so poll-based callers (wait_until_status) catch the
             # PROCESSING→ready transition without waiting for stream silence.
-            if cached == TerminalStatus.PROCESSING:
+            if cached == TerminalStatus.PROCESSING or armed_ready:
                 buffer = self._buffers.get(terminal_id, "")
             else:
                 buffer = ""
 
-        if cached == TerminalStatus.PROCESSING and buffer:
+        if (cached == TerminalStatus.PROCESSING and buffer) or armed_ready:
             # Keep the poll-time refresh on the SAME detection path that
             # produced the cached status.  In rendered-screen mode the raw
             # pipe-pane stream still contains stale completion markers and
@@ -596,18 +694,41 @@ class StatusMonitor:
                 and provider is not None
                 and getattr(provider, "supports_screen_detection", False)
             )
+            if not use_screen and not buffer:
+                return cached
             fresh = (
                 self._detect_screen(terminal_id, provider)
                 if use_screen
                 else self._detect_status(terminal_id, buffer)
             )
             logger.debug(
-                f"get_status [{terminal_id}]: cached=PROCESSING, "
+                f"get_status [{terminal_id}]: cached={cached.value}, "
                 f"fresh={fresh.value}, detector={'screen' if use_screen else 'raw'}, "
                 f"buffer_len={len(buffer)}"
             )
-            if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
-                self._apply_detection(terminal_id, fresh)
+            if armed_ready and fresh == TerminalStatus.PROCESSING:
+                self._apply_detection(terminal_id, fresh, generation)
+                return fresh
+            if (
+                armed_ready
+                and fresh in _STICKY_READY_STATUSES
+                and buffer
+                and provider is not None
+                and provider.confirms_current_turn_completion(buffer) is True
+            ):
+                # A provider-authenticated response delta proves a very fast
+                # turn completed before PROCESSING was sampled.  Emit the
+                # missing edge, consuming the arm, then settle to the detected
+                # ready state in the same poll.
+                self._apply_detection(terminal_id, TerminalStatus.PROCESSING, generation)
+                self._apply_detection(terminal_id, fresh, generation)
+                return fresh
+            if (
+                cached == TerminalStatus.PROCESSING
+                and fresh != TerminalStatus.PROCESSING
+                and fresh != TerminalStatus.UNKNOWN
+            ):
+                self._apply_detection(terminal_id, fresh, generation)
                 return fresh
         return cached
 

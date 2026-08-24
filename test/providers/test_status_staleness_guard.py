@@ -44,6 +44,28 @@ class TestContentBasedStalenessGuard:
         assert provider.get_status(stale_buffer) == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_pre_send_snapshot_survives_fast_completion_during_transport(self, mock_backend):
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        old_buffer = "⏺ Previous response\n────────────────────────\n❯ "
+        new_buffer = (
+            "⏺ Previous response\n────────────────────────\n"
+            "❯ quick task\n"
+            "⏺ New response\n────────────────────────\n❯ "
+        )
+        mock_backend.get_history.return_value = old_buffer
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+
+        provider.prepare_input_delivery()
+        # The response appears before send_keys returns.  The post-send commit
+        # must not replace the old baseline with this already-completed frame.
+        mock_backend.get_history.return_value = new_buffer
+        provider.mark_input_received()
+
+        assert provider.confirms_current_turn_completion(new_buffer) is True
+        assert provider._snapshot_last_response == "Previous response"
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_shorter_buffer_after_input_still_processing(self, mock_backend):
         """Buffer SHRINKS after input (Ink composer-collapse) → still PROCESSING
         while tail content unchanged. This is the key regression the length-based

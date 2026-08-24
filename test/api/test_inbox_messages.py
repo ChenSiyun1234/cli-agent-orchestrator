@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import app
-from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 
 
 @pytest.fixture
@@ -106,6 +106,14 @@ class TestGetInboxMessagesEndpoint:
             assert len(data) == 1
             mock_get.assert_called_once_with("abcdef12", limit=5, status=MessageStatus.PENDING)
 
+    def test_newest_window_flag_is_forwarded_explicitly(self, client, sample_inbox_messages):
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
+            mock_get.return_value = sample_inbox_messages[-2:]
+            response = client.get("/terminals/abcdef12/inbox/messages?limit=2&newest_first=true")
+
+        assert response.status_code == 200
+        mock_get.assert_called_once_with("abcdef12", limit=2, status=None, newest_first=True)
+
     def test_invalid_status_parameter(self, client):
         """Test error handling for invalid status parameter."""
         response = client.get("/terminals/abcdef12/inbox/messages?status=invalid_status")
@@ -181,6 +189,43 @@ class TestGetInboxMessagesEndpoint:
             parsed_datetime = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
             assert isinstance(parsed_datetime, datetime)
 
+    def test_direct_task_lifecycle_fields_are_exposed_without_inference(self, client):
+        observed = datetime(2026, 8, 23, 10, 1, 5)
+        message = InboxMessage(
+            id=101,
+            sender_id="architect",
+            receiver_id="abcdef12",
+            message="GOAL: task",
+            status=MessageStatus.DELIVERED,
+            created_at=datetime(2026, 8, 23, 10, 1, 0),
+            orchestration_type=OrchestrationType.ASSIGN,
+            task_id="direct-101",
+            reply_to_message_id=None,
+            delivered_at=observed,
+            started_at=None,
+            reviewed_at=datetime(2026, 8, 23, 10, 8, 0),
+            review_verdict="ACCEPT",
+        )
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages", return_value=[message]):
+            response = client.get("/terminals/abcdef12/inbox/messages")
+
+        assert response.status_code == 200
+        assert response.json()[0] == {
+            "id": 101,
+            "sender_id": "architect",
+            "receiver_id": "abcdef12",
+            "message": "GOAL: task",
+            "status": "delivered",
+            "created_at": "2026-08-23T10:01:00",
+            "orchestration_type": "assign",
+            "task_id": "direct-101",
+            "reply_to_message_id": None,
+            "delivered_at": "2026-08-23T10:01:05",
+            "started_at": None,
+            "reviewed_at": "2026-08-23T10:08:00",
+            "review_verdict": "ACCEPT",
+        }
+
     def test_all_status_values(self, client, sample_inbox_messages):
         """Test filtering by each possible status value."""
         for status_value in ["pending", "delivered", "failed"]:
@@ -199,6 +244,69 @@ class TestGetInboxMessagesEndpoint:
 
                 for msg_data in data:
                     assert msg_data["status"] == status_value
+
+
+class TestCreateInboxMessageEndpoint:
+    def test_assign_identity_and_delivery_mode_are_forwarded(self, client):
+        root = InboxMessage(
+            id=101,
+            sender_id="architect",
+            receiver_id="abcdef12",
+            message="GOAL: task",
+            status=MessageStatus.PENDING,
+            created_at=datetime(2026, 8, 23, 10, 1, 0),
+            orchestration_type=OrchestrationType.ASSIGN,
+            task_id="direct-101",
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                return_value=root,
+            ) as mock_create,
+            patch("cli_agent_orchestrator.api.main.inbox_service.deliver_pending") as mock_deliver,
+        ):
+            response = client.post(
+                "/terminals/abcdef12/inbox/messages",
+                params={
+                    "sender_id": "architect",
+                    "message": "GOAL: task",
+                    "orchestration_type": "assign",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json()["message_id"] == 101
+        assert response.json()["task_id"] == "direct-101"
+        assert response.json()["orchestration_type"] == "assign"
+        mock_create.assert_called_once_with(
+            "architect",
+            "abcdef12",
+            "GOAL: task",
+            task_id=None,
+            reply_to_message_id=None,
+            review_verdict=None,
+            orchestration_type="assign",
+        )
+        mock_deliver.assert_called_once()
+
+    def test_integrity_error_is_bad_request_not_missing_terminal(self, client):
+        with patch(
+            "cli_agent_orchestrator.api.main.create_inbox_message",
+            side_effect=ValueError(
+                "Direct task 'broken' must have exactly one ASSIGN root; found 0"
+            ),
+        ):
+            response = client.post(
+                "/terminals/abcdef12/inbox/messages",
+                params={
+                    "sender_id": "architect",
+                    "message": "Reviewed.",
+                    "task_id": "broken",
+                    "review_verdict": "ACCEPT",
+                },
+            )
+
+        assert response.status_code == 400
 
 
 class TestDatabaseFunctionCompatibility:

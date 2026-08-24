@@ -35,6 +35,7 @@ from cli_agent_orchestrator.clients.database import create_terminal as db_create
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
+    list_all_terminals,
     list_siblings_by_group_prefix,
     update_last_active,
     update_terminal_group,
@@ -44,6 +45,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.constants import (
     FIFO_DIR,
     PIPE_LIVENESS_TAIL_LINES,
+    REASONING_EFFORT_LEVELS,
     SESSION_PREFIX,
     TERMINAL_LOG_DIR,
 )
@@ -91,6 +93,11 @@ from cli_agent_orchestrator.utils.terminal import (
 )
 
 logger = logging.getLogger(__name__)
+
+_RESERVED_LAUNCH_METADATA_KEYS = (
+    "launch_model",
+    "launch_reasoning_effort",
+)
 
 # Upper bound (bytes) on a single offset-ranged read of a terminal log
 # (U5 / #504, BR-2). ``read_output_range`` clamps its ``length`` to this so a
@@ -169,6 +176,82 @@ SOFT_ENFORCEMENT_PROVIDERS = {
 }
 
 
+def restore_persisted_terminal_monitors() -> Dict[str, int]:
+    """Reconnect durable tmux terminals after ``cao-server`` restarts.
+
+    Tmux sessions and agent processes outlive the API process, but FIFO readers,
+    provider instances, and status buffers do not.  Rebuild only that in-memory
+    monitoring layer: never send input, relaunch a CLI, or mutate the terminal
+    record.  Missing/stale panes are retained in the database as evidence and
+    reported as skipped.
+    """
+
+    backend = get_backend()
+    result = {"restored": 0, "skipped": 0, "failed": 0}
+    if backend.supports_event_inbox():
+        return result
+
+    try:
+        terminals = list_all_terminals()
+    except Exception as exc:  # noqa: BLE001 - monitor restoration is best-effort
+        result["failed"] += 1
+        logger.warning("Could not list persisted terminals for monitor restoration: %s", exc)
+        return result
+
+    for terminal in terminals:
+        terminal_id = terminal["id"]
+        session_name = terminal["tmux_session"]
+        window_name = terminal["tmux_window"]
+        reader_started = False
+        try:
+            if not backend.session_exists(session_name):
+                result["skipped"] += 1
+                continue
+
+            # Verify the persisted window still exists before allocating a FIFO.
+            backend.get_history(session_name, window_name, tail_lines=1)
+            provider_manager.get_provider(terminal_id)
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+            def _probe_pane(s=session_name, w=window_name) -> str:
+                return backend.get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+            def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
+                backend.stop_pipe_pane(s, w)
+                backend.pipe_pane(s, w, p)
+
+            # A pane has exactly one pipe target.  Stop the stale pre-restart
+            # writer first, then attach the new process's reader and target.
+            backend.stop_pipe_pane(session_name, window_name)
+            fifo_manager.create_reader(
+                terminal_id,
+                pane_probe=_probe_pane,
+                rearm=_rearm_pipe,
+            )
+            reader_started = True
+            backend.pipe_pane(session_name, window_name, str(fifo_path))
+
+            # Prime status directly rather than republishing historical output;
+            # the append-only terminal log must not duplicate scrollback.
+            history = backend.get_history(session_name, window_name, tail_lines=500)
+            status_monitor.seed_terminal_history(terminal_id, history)
+            result["restored"] += 1
+        except Exception as exc:  # noqa: BLE001 - one stale pane must not block startup
+            result["failed"] += 1
+            if reader_started:
+                fifo_manager.stop_reader(terminal_id)
+            logger.warning(
+                "Failed to restore monitoring for terminal %s (%s:%s): %s",
+                terminal_id,
+                session_name,
+                window_name,
+                exc,
+            )
+
+    logger.info("Restored persisted terminal monitors: %s", result)
+    return result
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -185,6 +268,7 @@ async def create_terminal(
     engine: Optional[KiroEngine | str] = None,
     kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
     model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     use_worktree: bool = False,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -225,6 +309,8 @@ async def create_terminal(
             (e.g. MCP handoff/assign's own `model` parameter) pin a specific
             model for one worker without needing a dedicated agent profile.
             None = behavior unchanged (profile.model, if any, still applies).
+        reasoning_effort: Explicit native effort for Codex or Claude Code.
+            Other providers reject the value before allocating a terminal.
         use_worktree: If True, provision an isolated ``git worktree`` (issue
             #100) for this terminal instead of using ``working_directory`` as
             given -- resolves the repo root from ``working_directory`` (or the
@@ -307,6 +393,37 @@ async def create_terminal(
             if engine is not None:
                 raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
             resolved_engine = None
+
+        if reasoning_effort is not None:
+            if reasoning_effort not in REASONING_EFFORT_LEVELS:
+                allowed = ", ".join(sorted(REASONING_EFFORT_LEVELS))
+                raise ValueError(f"reasoning_effort must be one of: {allowed}")
+            if provider not in {ProviderType.CODEX.value, ProviderType.CLAUDE_CODE.value}:
+                raise ValueError(
+                    "reasoning_effort is supported only for providers 'codex' and 'claude_code'"
+                )
+
+        resolved_model = model or (profile.model if profile else None)
+        resolved_reasoning_effort = reasoning_effort
+        if (
+            resolved_reasoning_effort is None
+            and provider == ProviderType.CODEX.value
+            and profile is not None
+            and isinstance(profile.codexConfig, dict)
+        ):
+            profile_effort = profile.codexConfig.get("model_reasoning_effort")
+            if isinstance(profile_effort, str) and profile_effort in REASONING_EFFORT_LEVELS:
+                resolved_reasoning_effort = profile_effort
+        launch_metadata = dict(metadata or {})
+        # These reserved fields describe the process CAO actually launches;
+        # caller-supplied metadata must never be able to spoof them.
+        for key in _RESERVED_LAUNCH_METADATA_KEYS:
+            launch_metadata.pop(key, None)
+        if resolved_model:
+            launch_metadata["launch_model"] = resolved_model
+        if resolved_reasoning_effort:
+            launch_metadata["launch_reasoning_effort"] = resolved_reasoning_effort
+        metadata = launch_metadata or None
 
         # Resolve tool policy before persistence for non-Kiro providers too.
         if allowed_tools is None and profile is not None:
@@ -480,7 +597,8 @@ async def create_terminal(
             agent_profile,
             allowed_tools,
             skill_prompt=skill_prompt,
-            model=model or (profile.model if profile else None),
+            model=resolved_model,
+            reasoning_effort=reasoning_effort,
             engine=resolved_engine,
         )
 
@@ -736,8 +854,13 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
         window_name = metadata.get("tmux_window")
         if not session_name or not window_name:
             return False
-        output = get_backend().get_history(session_name, window_name, tail_lines=200)
-        status = provider.get_status(output)
+        output = get_backend().get_history(
+            session_name,
+            window_name,
+            tail_lines=200,
+            strip_escapes=True,
+        )
+        status = provider.get_status_from_screen(output.splitlines())
     except Exception:
         logger.debug(
             "Direct status probe for %s failed (falling through to cached path)",
@@ -835,6 +958,14 @@ async def _confirm_worker_started_or_resubmit(
         ):
             return True
 
+    # One final live-pane check closes the race where the worker starts during
+    # the last cached-status wait. Failure to observe this edge is still only
+    # an indeterminate delivery result; it is never proof that a live process
+    # should be destroyed.
+    if provider is not None and getattr(provider, "supports_direct_status_probe", False):
+        if await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider):
+            return True
+
     return False
 
 
@@ -917,22 +1048,23 @@ def _schedule_deferred_init(
                     provider=provider_instance,
                 )
                 if not started:
-                    logger.error(
-                        "Deferred init for %s: worker never started after "
-                        "resubmits; task not delivered — notifying caller and "
-                        "tearing down.",
+                    logger.warning(
+                        "Deferred init for %s: delivery could not be confirmed "
+                        "after resubmits; notifying caller and leaving the live "
+                        "worker available for inspection.",
                         terminal_id,
                     )
                     await asyncio.to_thread(
                         _notify_caller_of_deferred_failure,
                         terminal_id,
                         (
-                            f"Worker {terminal_id} received the assigned task but "
-                            f"never started processing (input not accepted after "
-                            f"retries). It has been deleted — re-assign the task."
+                            f"Worker {terminal_id} delivery could not be confirmed "
+                            f"after transport retries. It has been left running; "
+                            f"inspect its live terminal before re-sending or "
+                            f"re-assigning the task."
                         ),
                         registry,
-                        True,  # delete_worker
+                        False,  # status ambiguity is not a lifecycle failure
                     )
                     return
         except TerminalInputBlockedError as e:
@@ -1034,15 +1166,26 @@ def update_group(terminal_id: str, group: Optional[List[str]]) -> bool:
 def update_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
     """Replace a terminal's free-form metadata dict.
 
-    Whole-dict replace, not a merge: concurrent calls are last-write-wins
-    (tedswinyar, PR #433 review). Acceptable for this field -- callers should
-    re-send the full intended dict each time rather than assuming a partial
-    update accumulates on top of a prior one.
+    Whole-dict replace for caller-owned fields.  CAO-owned launch identity is
+    preserved from the durable row and caller attempts to erase or spoof those
+    reserved fields are ignored.
 
     Returns:
         False if the terminal does not exist, True otherwise.
     """
-    return update_terminal_metadata(terminal_id, metadata)
+    current = get_terminal_metadata(terminal_id)
+    if current is None:
+        return False
+
+    current_metadata = current.get("metadata")
+    if not isinstance(current_metadata, dict):
+        current_metadata = {}
+    replacement = dict(metadata or {})
+    for key in _RESERVED_LAUNCH_METADATA_KEYS:
+        replacement.pop(key, None)
+        if key in current_metadata:
+            replacement[key] = current_metadata[key]
+    return update_terminal_metadata(terminal_id, replacement or None)
 
 
 def list_siblings(
@@ -1211,6 +1354,13 @@ def send_input(
         # arm set by notify_input_sent above; reset_buffer would wipe the arm and
         # latch-block the IDLE→PROCESSING transition for the whole turn.
         status_monitor.clear_rolling_buffer(terminal_id)
+
+        # Claude's status detector needs the PRE-send response as its baseline
+        # so a turn that finishes during send_keys is still distinguishable
+        # from a stale prior-turn repaint.  This hook must not commit dispatch
+        # state; mark_input_received remains after successful delivery below.
+        if provider:
+            provider.prepare_input_delivery()
 
         get_backend().send_keys(
             metadata["tmux_session"],

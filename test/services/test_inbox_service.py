@@ -8,12 +8,18 @@ import pytest
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
-from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.inbox_service import InboxService
 
 
-def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageStatus.PENDING):
+def _make_message(
+    id=1,
+    receiver_id="term-1",
+    message="hello",
+    status=MessageStatus.PENDING,
+    orchestration_type=None,
+):
     return InboxMessage(
         id=id,
         sender_id="sender-1",
@@ -21,6 +27,7 @@ def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageSta
         message=message,
         status=status,
         created_at=datetime.now(),
+        orchestration_type=orchestration_type,
     )
 
 
@@ -184,6 +191,54 @@ class TestDeliverPending:
 
         assert order[0] == ("update", (1, MessageStatus.DELIVERED))
         assert order[1][0] == "send"
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_assign_row_preserves_assign_delivery_mode(
+        self,
+        mock_get,
+        mock_monitor,
+        mock_term_svc,
+        mock_update,
+    ):
+        mock_get.return_value = [_make_message(orchestration_type=OrchestrationType.ASSIGN)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        mock_term_svc.send_input.assert_called_once_with(
+            "term-1",
+            "hello",
+            registry=None,
+            sender_id="sender-1",
+            orchestration_type=OrchestrationType.ASSIGN,
+        )
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_unknown_delivery_mode_defaults_to_send_message(
+        self,
+        mock_get,
+        mock_monitor,
+        mock_term_svc,
+        mock_update,
+    ):
+        message = MagicMock()
+        message.id = 1
+        message.sender_id = "sender-1"
+        message.message = "hello"
+        message.orchestration_type = MagicMock()
+        mock_get.return_value = [message]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        InboxService().deliver_pending("term-1")
+
+        mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")

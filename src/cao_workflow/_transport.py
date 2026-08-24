@@ -17,8 +17,6 @@ from urllib.request import Request, urlopen
 # because the shim must not import from cli_agent_orchestrator.* (BR-2).
 _TRANSPORT_SLACK = 30.0
 
-_BASE_TIMEOUT_DEFAULT = 600.0
-
 
 @dataclass(frozen=True)
 class _Response:
@@ -33,8 +31,10 @@ def _post(url: str, body: dict, timeout: "float | None" = None) -> _Response:
     unchanged on transport failure — the caller (``run_step``) wraps it into
     ``ShimTransportError``.
     """
-    base_timeout = timeout if timeout is not None else _BASE_TIMEOUT_DEFAULT
-    socket_timeout = base_timeout + _TRANSPORT_SLACK
+    # A workflow step has no overall wall-clock cap unless its author supplied
+    # one. ``None`` lets the long-poll remain open; explicit bounds still receive
+    # transport headroom so the client socket never races the server deadline.
+    socket_timeout = timeout + _TRANSPORT_SLACK if timeout is not None else None
     data = json.dumps(body).encode("utf-8")
     request = Request(
         url,

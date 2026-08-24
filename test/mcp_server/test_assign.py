@@ -439,19 +439,27 @@ class TestCreateTerminalUseWorktree:
 class TestAssignSenderIdInjection:
     """Tests for sender ID injection in _assign_impl.
 
-    _assign_impl now uses the deferred-init path: it composes the callback-
-    instructions suffix on the MCP-server side and passes the full message
-    to ``_create_terminal`` via ``initial_message`` so cao-server can deliver
-    it in the background once the worker's provider finishes initializing.
-    The tool-call itself returns as soon as the tmux window/DB row exist.
+    _assign_impl starts provider initialization without a direct initial
+    message, persists one inbox ASSIGN root, and lets the inbox readiness gate
+    deliver that exact row.
     """
+
+    @pytest.fixture(autouse=True)
+    def _stable_assign_root(self):
+        with patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox") as mock_inbox:
+            mock_inbox.return_value = {
+                "success": True,
+                "message_id": 101,
+                "task_id": "direct-101",
+            }
+            self.mock_inbox = mock_inbox
+            yield
 
     @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
     def test_assign_appends_sender_id_when_injection_enabled(self, mock_create, _nudge):
-        """When injection is enabled, assign should pass a message with the
-        sender ID suffix as ``initial_message`` to _create_terminal."""
+        """The persisted ASSIGN body includes the automatic callback suffix."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
 
         mock_create.return_value = ("worker-1", "claude_code")
@@ -460,17 +468,23 @@ class TestAssignSenderIdInjection:
             result = _assign_impl("developer", "Analyze the logs")
 
         assert result["success"] is True
-        # _create_terminal is called with defer_init=True and the composed message
+        # Initialization is deferred, but the task body is not delivered directly.
         _, kwargs = mock_create.call_args
         assert kwargs["defer_init"] is True
-        sent_message = kwargs["initial_message"]
+        assert "initial_message" not in kwargs
+        sent_message = self.mock_inbox.call_args.args[1]
         assert sent_message.startswith("Analyze the logs")
         assert "[Assigned by terminal a1b2c3d4" in sent_message
         assert "send results back to terminal a1b2c3d4 using send_message]" in sent_message
-        # And the orchestration_type is ASSIGN so plugin events see it
         from cli_agent_orchestrator.models.inbox import OrchestrationType
 
-        assert kwargs["initial_message_orchestration_type"] == OrchestrationType.ASSIGN
+        self.mock_inbox.assert_called_once_with(
+            "worker-1",
+            sent_message,
+            orchestration_type=OrchestrationType.ASSIGN,
+        )
+        assert result["message_id"] == 101
+        assert result["task_id"] == "direct-101"
 
     @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
@@ -485,8 +499,7 @@ class TestAssignSenderIdInjection:
             result = _assign_impl("developer", "Analyze the logs")
 
         assert result["success"] is True
-        _, kwargs = mock_create.call_args
-        assert kwargs["initial_message"] == "Analyze the logs"
+        assert self.mock_inbox.call_args.args[1] == "Analyze the logs"
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
@@ -503,6 +516,7 @@ class TestAssignSenderIdInjection:
         assert result["terminal_id"] is None
         assert "CAO_TERMINAL_ID not set" in result["message"]
         mock_create.assert_not_called()
+        self.mock_inbox.assert_not_called()
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
@@ -521,6 +535,7 @@ class TestAssignSenderIdInjection:
         assert result["terminal_id"] is None
         assert "CAO_TERMINAL_ID not set" in result["message"]
         mock_create.assert_not_called()
+        self.mock_inbox.assert_not_called()
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
@@ -537,6 +552,22 @@ class TestAssignSenderIdInjection:
         assert result["success"] is False
         assert result["terminal_id"] is None
         assert "Assignment failed" in result["message"]
+        self.mock_inbox.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_assign_surfaces_terminal_when_root_persistence_fails(self, mock_create):
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        mock_create.return_value = ("worker-orphan", "claude_code")
+        self.mock_inbox.side_effect = RuntimeError("database unavailable")
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = _assign_impl("developer", "Analyze the logs")
+
+        assert result["success"] is False
+        assert result["terminal_id"] == "worker-orphan"
+        assert "database unavailable" in result["message"]
 
     @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
@@ -551,8 +582,7 @@ class TestAssignSenderIdInjection:
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "deadbeef"}):
             _assign_impl("developer", original)
 
-        _, kwargs = mock_create.call_args
-        sent_message = kwargs["initial_message"]
+        sent_message = self.mock_inbox.call_args.args[1]
         assert sent_message.startswith(original)
         assert sent_message.index("[Assigned by terminal") > len(original)
 
@@ -571,9 +601,76 @@ class TestAssignSenderIdInjection:
 
         assert result["success"] is True
         assert result["terminal_id"] == "worker-fast"
+        assert result["message_id"] == 101
+        assert result["task_id"] == "direct-101"
         # The message must reflect deferred delivery so the LLM does not
         # falsely conclude the worker has already received the task.
         assert "initializing" in result["message"].lower()
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_assign_return_review_lifecycle_uses_one_persisted_root(
+        self,
+        mock_create,
+        _nudge,
+    ):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients.database import (
+            Base,
+            create_inbox_message,
+            create_terminal,
+            get_inbox_messages,
+        )
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        engine = create_engine("sqlite:///:memory:")
+        test_session = sessionmaker(bind=engine)
+        Base.metadata.create_all(bind=engine)
+        mock_create.return_value = ("c0ffee01", "claude_code")
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_session):
+            create_terminal("a1b2c3d4", "cao-s", "architect", "codex")
+            create_terminal("c0ffee01", "cao-s", "worker-one", "claude_code")
+
+            def persist_root(receiver_id, message, **kwargs):
+                root = create_inbox_message(
+                    "a1b2c3d4",
+                    receiver_id,
+                    message,
+                    **kwargs,
+                )
+                return {
+                    "success": True,
+                    "message_id": root.id,
+                    "task_id": root.task_id,
+                }
+
+            self.mock_inbox.side_effect = persist_root
+            with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+                assigned = _assign_impl("developer", "Do work")
+            assert assigned["success"], assigned
+
+            returned = create_inbox_message("c0ffee01", "a1b2c3d4", "Done.")
+            reviewed = create_inbox_message(
+                "a1b2c3d4",
+                "c0ffee01",
+                "Accepted.",
+                task_id=assigned["task_id"],
+                reply_to_message_id=returned.id,
+                review_verdict="ACCEPT",
+            )
+            worker_rows = get_inbox_messages("c0ffee01", limit=10)
+
+        roots = [row for row in worker_rows if row.reply_to_message_id is None]
+        assert len(roots) == 1
+        assert assigned["message_id"] == roots[0].id
+        assert returned.task_id == assigned["task_id"]
+        assert returned.reply_to_message_id == roots[0].id
+        assert reviewed.reply_to_message_id == returned.id
+        assert roots[0].review_verdict == "ACCEPT"
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
@@ -588,6 +685,38 @@ class TestAssignSenderIdInjection:
         assert result["success"] is True
         _, kwargs = mock_create.call_args
         assert kwargs["model"] == "fable-5"
+
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_assign_forwards_effort_and_task_specific_metadata(self, mock_create):
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        mock_create.return_value = ("worker-1", "claude_code")
+        message = (
+            "GOAL: Close S0 checkpoint resume\n"
+            "EFFORT: XHigh\n"
+            "SCOPE: experiments/runner.py\n"
+            "STOP WHEN: tests fail\n"
+            "RETURN: pytest -q"
+        )
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = _assign_impl(
+                "developer",
+                message,
+                model="claude-opus-5",
+                reasoning_effort="xhigh",
+            )
+
+        assert result["success"] is True
+        _, kwargs = mock_create.call_args
+        assert kwargs["model"] == "claude-opus-5"
+        assert kwargs["reasoning_effort"] == "xhigh"
+        assert kwargs["metadata"] == {
+            "display_name": "Close S0 checkpoint resume",
+            "task_family": "Close S0 checkpoint resume",
+            "project_stage": "S0",
+        }
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")

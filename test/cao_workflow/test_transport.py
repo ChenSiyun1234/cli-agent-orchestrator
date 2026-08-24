@@ -46,7 +46,7 @@ def test_socket_timeout_includes_transport_slack(monkeypatch):
     assert captured_kwargs["timeout"] == 100.0 + _TRANSPORT_SLACK
 
 
-def test_default_timeout_used_when_none_given(monkeypatch):
+def test_none_timeout_keeps_long_poll_unbounded(monkeypatch):
     captured_kwargs = {}
 
     def fake_urlopen(request, timeout=None):
@@ -57,7 +57,7 @@ def test_default_timeout_used_when_none_given(monkeypatch):
 
     _post("http://localhost:9889/terminals/run-step", {"a": 1}, timeout=None)
 
-    assert captured_kwargs["timeout"] == 600.0 + _TRANSPORT_SLACK
+    assert captured_kwargs["timeout"] is None
 
 
 def test_http_error_translated_to_response_not_raised(monkeypatch):

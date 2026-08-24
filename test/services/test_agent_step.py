@@ -66,6 +66,20 @@ def _patch_terminal_layer(
 
 
 class TestHappyPath:
+    def test_default_completion_wait_has_no_deadline(self):
+        from cli_agent_orchestrator.services.agent_step import _wait_for_completion
+
+        with (
+            patch(f"{_MODULE}.time.monotonic", side_effect=AssertionError("no deadline")),
+            patch(
+                f"{_MODULE}.status_monitor.get_status",
+                return_value=TerminalStatus.COMPLETED,
+            ),
+        ):
+            coroutine = _wait_for_completion("abc12345", timeout=None)
+            with pytest.raises(StopIteration):
+                coroutine.send(None)
+
     def test_create_per_call_runs_full_sequence_and_tears_down(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with (
@@ -251,10 +265,8 @@ class TestHappyPath:
             asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
         assert m_create.await_args.kwargs["model"] is None
 
-    def test_reused_terminal_never_passes_model_to_create(self):
-        """Reusing a terminal skips create_terminal entirely -- model has
-        nothing to apply to and must not be silently expected to retarget an
-        already-running provider."""
+    def test_reused_terminal_matching_model_skips_create(self):
+        """Reuse accepts an explicit model only when it matches launch evidence."""
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with (
             create as m_create,
@@ -266,13 +278,132 @@ class TestHappyPath:
             status,
             patch(
                 f"{_MODULE}.terminal_service.get_terminal_metadata",
-                return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
+                return_value={
+                    "id": "reuse99",
+                    "provider": "kiro_cli",
+                    "engine": "v2",
+                    "metadata": {"launch_model": "fable-5"},
+                },
             ),
         ):
             asyncio.run(
                 run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99", model="fable-5")
             )
         m_create.assert_not_awaited()
+
+    def test_reused_terminal_rejects_model_mismatch(self):
+        from cli_agent_orchestrator.services.agent_step import _validate_reused_terminal
+
+        with patch(
+            f"{_MODULE}.terminal_service.get_terminal_metadata",
+            return_value={
+                "provider": "codex",
+                "metadata": {"launch_model": "gpt-5.6-sol"},
+            },
+        ):
+            with pytest.raises(ValueError, match="Model mismatch"):
+                asyncio.run(
+                    _validate_reused_terminal(
+                        "reuse99",
+                        "codex",
+                        None,
+                        "gpt-5.5",
+                        None,
+                    )
+                )
+
+    def test_reused_terminal_rejects_reasoning_effort_mismatch(self):
+        from cli_agent_orchestrator.services.agent_step import _validate_reused_terminal
+
+        with patch(
+            f"{_MODULE}.terminal_service.get_terminal_metadata",
+            return_value={
+                "provider": "codex",
+                "metadata": {
+                    "launch_model": "gpt-5.6-sol",
+                    "launch_reasoning_effort": "high",
+                },
+            },
+        ):
+            with pytest.raises(ValueError, match="Reasoning effort mismatch"):
+                asyncio.run(
+                    _validate_reused_terminal(
+                        "reuse99",
+                        "codex",
+                        None,
+                        "gpt-5.6-sol",
+                        "xhigh",
+                    )
+                )
+
+    def test_reused_terminal_rejects_agent_profile_mismatch(self):
+        from cli_agent_orchestrator.services.agent_step import _validate_reused_terminal
+
+        with patch(
+            f"{_MODULE}.terminal_service.get_terminal_metadata",
+            return_value={
+                "provider": "codex",
+                "agent_profile": "research_reviewer",
+                "metadata": {},
+            },
+        ):
+            with pytest.raises(ValueError, match="Agent profile mismatch"):
+                asyncio.run(
+                    _validate_reused_terminal(
+                        "reuse99",
+                        "codex",
+                        None,
+                        None,
+                        None,
+                        requested_agent="implementer",
+                    )
+                )
+
+    def test_reused_terminal_rejects_busy_status_before_send(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.PROCESSING
+        )
+        with (
+            create,
+            send as m_send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={
+                    "id": "reuse99",
+                    "provider": "kiro_cli",
+                    "agent_profile": "dev",
+                    "engine": "v2",
+                },
+            ),
+        ):
+            with pytest.raises(ValueError, match="is not ready"):
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99"))
+        m_send.assert_not_called()
+
+    def test_reused_terminal_rejects_concurrent_claim(self):
+        from cli_agent_orchestrator.services.agent_step import _REUSED_TERMINAL_LOCKS
+
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+
+        async def scenario():
+            lock = asyncio.Lock()
+            await lock.acquire()
+            _REUSED_TERMINAL_LOCKS["reuse99"] = lock
+            try:
+                with pytest.raises(ValueError, match="already claimed"):
+                    await run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99")
+            finally:
+                lock.release()
+                _REUSED_TERMINAL_LOCKS.pop("reuse99", None)
+
+        with create, send as m_send, delete, get_output, exit_cli, wait, status:
+            asyncio.run(scenario())
+        m_send.assert_not_called()
 
     def test_no_session_name_creates_new_session(self):
         """Regression: session_name=None must create a NEW tmux session
@@ -564,6 +695,30 @@ class TestIdleCompletionSignal:
         with create, send, delete, get_output, exit_cli, wait, status:
             result = asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
         assert result.status == TerminalStatus.COMPLETED
+
+    def test_stale_completed_marker_waits_for_new_turn(self):
+        """An armed previous-turn COMPLETED cannot finish newly-sent work."""
+        from cli_agent_orchestrator.services.agent_step import _wait_for_completion
+
+        with (
+            patch(
+                f"{_MODULE}.status_monitor.get_status",
+                side_effect=[
+                    TerminalStatus.COMPLETED,
+                    TerminalStatus.PROCESSING,
+                    TerminalStatus.COMPLETED,
+                ],
+            ) as get_status,
+            patch(
+                f"{_MODULE}.status_monitor.is_input_armed",
+                side_effect=[True, False],
+            ) as is_armed,
+            patch(f"{_MODULE}.asyncio.sleep", new=AsyncMock()),
+        ):
+            asyncio.run(_wait_for_completion("reuse99", timeout=None))
+
+        assert get_status.call_count == 3
+        assert is_armed.call_count == 2
 
     def test_idle_before_any_work_does_not_resolve_early(self):
         """A bare IDLE with NO prior working state is the pre-pickup window, not

@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # Regex patterns for Codex output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
-IDLE_PROMPT_PATTERN = r"(?:❯|›|codex>)"
+IDLE_PROMPT_PATTERN = r"(?:❯|›|»|codex>)"
 # Number of lines from the bottom of capture to check for the idle prompt.
 # With --no-alt-screen, codex output is inline (scrollback contains history),
 # so we can't anchor to \Z. Instead, check the last few lines where the prompt
@@ -49,15 +49,15 @@ ASSISTANT_PREFIX_PATTERN = r"^(?:(?:assistant|codex|agent)\s*:|[^\S\n]*•)"
 # paren) is required so legitimate model bullets like "• Called attention
 # to the bug" don't get filtered as tool calls.
 MCP_TOOL_CALL_PATTERN = r"^[^\S\n]*•\s+Called\s+[\w-]+\.[\w-]+\("
-# Match user input: "You ..." (label style) or "› text" (Codex interactive prompt).
-# The "›[^\S\n]*\S" alternative requires a non-whitespace character on the same line
-# to distinguish user input ("› what is your role?") from the empty idle prompt ("› ").
+# Match user input: "You ..." (label style) or a Codex interactive prompt.
+# The "[›»][^\S\n]*\S" alternative requires a non-whitespace character on the
+# same line to distinguish user input from an empty idle prompt.
 # [^\S\n] matches horizontal whitespace only (spaces/tabs), preventing the pattern
 # from crossing newline boundaries into subsequent lines.
-USER_PREFIX_PATTERN = r"^(?:You\b|›[^\S\n]*\S)"
+USER_PREFIX_PATTERN = r"^(?:You\b|[›»][^\S\n]*\S)"
 # Strict idle prompt pattern for extraction: matches empty prompt lines only.
-# Distinguishes "› " (idle) from "› user message" (user input with text).
-IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|codex>)\s*$"
+# Distinguishes an empty composer from a prompt containing user text.
+IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|»|codex>)\s*$"
 
 PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzing)\b"
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
@@ -72,13 +72,14 @@ ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)
 # which is shared across v0.111 and v0.136 status bars.
 TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])"
 # Codex TUI progress spinner: "• Working (0s • esc to interrupt)",
-# "• Working (1m 00s ...)", "• Working (1h 00m 00s ...)", or dynamic
-# prefixes such as "• Starting script creation (10s • esc to interrupt)".
+# "◦ Working (0s • esc to interrupt)", "• Working (1m 00s ...)", or
+# dynamic prefixes such as "◦ Starting script creation (10s • esc to
+# interrupt)". Codex 0.149 alternates between the solid and hollow bullets.
 # Codex expands the elapsed value at the minute and hour boundaries.
 # Appears inline with --no-alt-screen when the agent is actively processing.
 # Must be checked before COMPLETED to avoid false positives (the • matches
 # ASSISTANT_PREFIX_PATTERN and the TUI footer › matches idle prompt).
-TUI_PROGRESS_PATTERN = r"•[^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
+TUI_PROGRESS_PATTERN = r"[•◦][^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*[•◦]\s*esc to interrupt\)"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory.
 # Two known variants:
@@ -125,7 +126,7 @@ UPDATE_DIALOG_PATTERN = r"Update available!\s+\S+\s+->\s+\S+"
 UPDATE_DIALOG_MENU_PATTERN = r"Skip until next version"
 UPDATE_DIALOG_FOOTER = TRUST_PROMPT_FOOTER
 STARTUP_PROMPT_BOTTOM_LINES = 15
-STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
+STARTUP_ACTIVITY_PATTERN = r"^\s*[•◦][^\S\n]+\S"
 STARTUP_BLOCKING_INPUT_PATTERN = (
     r"(?:Command Approval Required|\[[aA]\]\s+Accept\b|"
     r"\[[dD]\]\s+Decline\b|Press enter to continue)"
@@ -139,7 +140,8 @@ STARTUP_IDLE_PLACEHOLDER_PATTERN = (
     r"Write tests for @filename|"
     r"Improve documentation in @filename|"
     r"Run /review on my current changes|"
-    r"Use /skills to list available skills"
+    r"Use /skills to list available skills|"
+    r"Ask Codex to do anything"
     r")\s*$"
 )
 
@@ -397,6 +399,10 @@ class CodexProvider(BaseProvider):
     # through StatusMonitor's pyte-composited viewport so get_status() sees only
     # the live frame rather than stale redraw history.
     supports_screen_detection = True
+    # The deferred-delivery guard may need a synchronous live-pane check when
+    # the event-driven cache misses the first PROCESSING frame. Codex's
+    # get_status_from_screen() is calibrated for that rendered viewport.
+    supports_direct_status_probe = True
 
     def __init__(
         self,
@@ -407,6 +413,7 @@ class CodexProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
@@ -414,6 +421,7 @@ class CodexProvider(BaseProvider):
         self._agent_profile = agent_profile
         # Explicit per-call override for profile.model, see _build_codex_command.
         self._model = model
+        self._reasoning_effort = reasoning_effort
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
@@ -631,6 +639,13 @@ class CodexProvider(BaseProvider):
             if profile.codexConfig:
                 for key, value in profile.codexConfig.items():
                     command_parts.extend(["-c", _toml_override(key, value)])
+
+        # Emit the per-call effort after profile codexConfig so a task-scoped
+        # native selection wins without editing any user or named profile.
+        if self._reasoning_effort:
+            command_parts.extend(
+                ["-c", _toml_override("model_reasoning_effort", self._reasoning_effort)]
+            )
 
         # Suppress the startup update dialog at the source. Placed last so it
         # wins even if a profile sets check_for_update_on_startup=true.

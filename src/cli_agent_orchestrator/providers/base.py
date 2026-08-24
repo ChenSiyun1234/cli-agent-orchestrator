@@ -273,6 +273,25 @@ class BaseProvider(ABC):
         """Clean up provider resources."""
         pass
 
+    def prepare_input_delivery(self) -> None:
+        """Capture any provider-specific pre-send baseline.
+
+        Called immediately before the transport sends input.  The default is a
+        no-op: providers that need content-based stale-frame detection may
+        snapshot the current pane here, but MUST NOT commit dispatch state until
+        :meth:`mark_input_received` runs after a successful send.
+        """
+
+    def confirms_current_turn_completion(self, output: str) -> bool:
+        """Return whether ``output`` proves completion of the just-sent turn.
+
+        The conservative default is False.  A provider may opt in only when it
+        has a pre-send baseline that distinguishes a new response from a stale
+        repaint of the previous ready screen.
+        """
+
+        return False
+
     def mark_input_received(self) -> None:
         """Notify the provider that external input was sent to the terminal.
 

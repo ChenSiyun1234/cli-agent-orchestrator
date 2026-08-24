@@ -84,6 +84,22 @@ class TestGetStatusEventInbox:
         sm = StatusMonitor()
         assert sm.get_status("t1") == TerminalStatus.UNKNOWN
 
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_native_processing_consumes_arm_before_completion(self, mock_get_backend, mock_pm):
+        """Herdr's authoritative working edge must release the new-turn latch."""
+
+        mock_get_backend.return_value = _backend(event_inbox=True)
+        provider = MagicMock()
+        provider.get_status.side_effect = [TerminalStatus.PROCESSING, TerminalStatus.COMPLETED]
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm.is_input_armed("t1") is False
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+
 
 class TestScreenDetection:
     """Rendered-screen detection should fail soft and keep monitoring alive."""
@@ -91,9 +107,7 @@ class TestScreenDetection:
     @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
-    def test_processing_poll_refresh_stays_on_screen_path(
-        self, mock_get_backend, mock_pm
-    ):
+    def test_processing_poll_refresh_stays_on_screen_path(self, mock_get_backend, mock_pm):
         """A raw redraw stream must not overrule a live rendered spinner.
 
         This is the exact run_step failure mode observed with Claude Code: the
@@ -116,6 +130,62 @@ class TestScreenDetection:
         assert sm.get_status("t1") == TerminalStatus.PROCESSING
         sm._detect_screen.assert_called_once_with("t1", provider)
         sm._detect_status.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_armed_idle_poll_refresh_detects_processing_on_screen(self, mock_get_backend, mock_pm):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.IDLE
+        sm._allow_processing_revert["t1"] = True
+        sm._buffers["t1"] = "raw redraw with stale idle composer"
+        sm._detect_screen = MagicMock(return_value=TerminalStatus.PROCESSING)
+        sm._detect_status = MagicMock(return_value=TerminalStatus.IDLE)
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._allow_processing_revert["t1"] is False
+        sm._detect_screen.assert_called_once_with("t1", provider)
+        sm._detect_status.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_authenticated_fast_completion_synthesizes_processing_edge(
+        self, mock_get_backend, mock_pm
+    ):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.confirms_current_turn_completion.return_value = True
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm._buffers["t1"] = "new response and ready composer"
+        sm.notify_input_sent("t1")
+        sm._detect_screen = MagicMock(return_value=TerminalStatus.COMPLETED)
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm.is_input_armed("t1") is False
+        provider.confirms_current_turn_completion.assert_called_once_with(
+            "new response and ready composer"
+        )
+
+    def test_stale_async_detection_cannot_consume_new_generation(self):
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1")
+        stale_generation = sm._input_generation["t1"]
+        sm.notify_input_sent("t1")
+
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, stale_generation)
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm.is_input_armed("t1") is True
 
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_render_error_falls_back_to_raw_buffer_detection(self, mock_pm):
@@ -204,7 +274,9 @@ class TestStickyLatching:
         m = _SequencedMonitor()
         m.feed(TerminalStatus.IDLE)
         m.sm.notify_input_sent("t1")
+        assert m.sm.is_input_armed("t1") is True
         m.feed(TerminalStatus.PROCESSING)
+        assert m.sm.is_input_armed("t1") is False
         assert m.status() == TerminalStatus.PROCESSING
         m.feed(TerminalStatus.COMPLETED)
         m.feed(TerminalStatus.PROCESSING)  # post-completion eviction flap

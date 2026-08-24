@@ -296,6 +296,7 @@ class TestCreateSession:
             initial_message=None,
             initial_message_orchestration_type=None,
             model=None,
+            reasoning_effort=None,
             group=None,
             metadata=None,
         )

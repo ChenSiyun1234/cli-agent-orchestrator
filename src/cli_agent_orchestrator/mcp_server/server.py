@@ -184,7 +184,9 @@ def _create_terminal(
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     use_worktree: bool = False,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -209,11 +211,16 @@ def _create_terminal(
             ahead of the agent profile's own static model field (where the
             resolved provider supports it). Honored by both the existing-
             session and new-session branches.
+        reasoning_effort: Optional native effort for a new Codex or Claude
+            Code terminal. It is a launch-time property and cannot be changed
+            by reusing an existing terminal.
         use_worktree: If True, the created terminal gets an isolated git
             worktree (issue #100 Phase 1) instead of sharing
             ``working_directory`` as given. Only meaningful on the
             existing-session (assign) branch below -- the new-session branch
             has no live caller today.
+        metadata: Optional small terminal metadata merged with CAO's observed
+            launch model/effort by the server.
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -275,15 +282,17 @@ def _create_terminal(
             params["engine"] = engine
         if model is not None:
             params["model"] = model
+        if reasoning_effort is not None:
+            params["reasoning_effort"] = reasoning_effort
         if use_worktree:
             params["use_worktree"] = "true"
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
-        json_body = None
+        json_body: Optional[Dict[str, Any]] = {"metadata": metadata} if metadata else None
         if defer_init:
             params["defer_init"] = "true"
-            json_body = {}
+            json_body = json_body or {}
             if initial_message is not None:
                 json_body["initial_message"] = initial_message
             if initial_message_orchestration_type is not None:
@@ -325,10 +334,13 @@ def _create_terminal(
             params["engine"] = engine
         if model is not None:
             params["model"] = model
+        if reasoning_effort is not None:
+            params["reasoning_effort"] = reasoning_effort
 
-        json_body = None
+        json_body = {"metadata": metadata} if metadata else None
         if initial_message is not None:
-            json_body = {"initial_message": initial_message}
+            json_body = json_body or {}
+            json_body["initial_message"] = initial_message
             if initial_message_orchestration_type is not None:
                 json_body["initial_message_orchestration_type"] = (
                     initial_message_orchestration_type.value
@@ -651,7 +663,14 @@ def _parse_run_step_error(
     return None, fallback, None
 
 
-def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
+def _send_to_inbox(
+    receiver_id: str,
+    message: str,
+    task_id: Optional[str] = None,
+    reply_to_message_id: Optional[int] = None,
+    review_verdict: Optional[str] = None,
+    orchestration_type: Optional[OrchestrationType] = None,
+) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
     Args:
@@ -669,12 +688,22 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     if not sender_id:
         raise ValueError("CAO_TERMINAL_ID not set - cannot determine sender")
 
+    params: Dict[str, Any] = {
+        "sender_id": sender_id,
+        "message": message,
+    }
+    if task_id is not None:
+        params["task_id"] = task_id
+    if reply_to_message_id is not None:
+        params["reply_to_message_id"] = reply_to_message_id
+    if review_verdict is not None:
+        params["review_verdict"] = review_verdict
+    if orchestration_type is not None:
+        params["orchestration_type"] = orchestration_type.value
+
     response = requests.post(
         f"{API_BASE_URL}/terminals/{receiver_id}/inbox/messages",
-        params={
-            "sender_id": sender_id,
-            "message": message,
-        },
+        params=params,
         timeout=_mcp_timeout(),
     )
     response.raise_for_status()
@@ -718,10 +747,11 @@ def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
 async def _handoff_impl(
     agent_profile: str,
     message: str,
-    timeout: int = 600,
+    timeout: Optional[int] = None,
     working_directory: Optional[str] = None,
     engine: Optional[str] = None,
     model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     use_worktree: bool = False,
 ) -> HandoffResult:
     """Implementation of handoff logic.
@@ -784,9 +814,10 @@ async def _handoff_impl(
             "agent": agent_profile,
             "prompt": shaped_message,
             "teardown": True,
-            "timeout": float(timeout),
             "use_worktree": use_worktree,
         }
+        if timeout is not None:
+            payload["timeout"] = float(timeout)
         if ctx.session_name:
             payload["session_name"] = ctx.session_name
         if ctx.caller_id:
@@ -799,10 +830,12 @@ async def _handoff_impl(
             payload["engine"] = engine
         if model:
             payload["model"] = model
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
 
         # Allow the full step time plus the server-side ready-wait (up to 120s)
         # plus headroom; the server enforces the per-step timeout internally.
-        client_timeout = float(timeout) + 180.0
+        client_timeout = float(timeout) + 180.0 if timeout is not None else None
         try:
             response = requests.post(
                 f"{API_BASE_URL}/terminals/run-step",
@@ -831,7 +864,11 @@ async def _handoff_impl(
             if kind == "error" or (kind is None and response.status_code == 502):
                 msg = f"Handoff failed: worker errored ({structured_detail})"
             elif kind == "timeout" or (kind is None and response.status_code == 504):
-                msg = f"Handoff timed out after {timeout} seconds"
+                msg = (
+                    f"Handoff timed out after {timeout} seconds"
+                    if timeout is not None
+                    else f"Handoff failed: worker timeout ({structured_detail})"
+                )
             else:
                 msg = f"Handoff failed: {structured_detail}"
             return HandoffResult(success=False, message=msg, output=None, terminal_id=tid)
@@ -877,6 +914,12 @@ _model_field_desc = (
     "profile's configured model as before."
 )
 
+_reasoning_effort_field_desc = (
+    "Optional native launch effort for Codex or Claude Code: low, medium, high, "
+    "xhigh, or max. This is independent of the model override and applies only "
+    "to a newly created worker terminal."
+)
+
 
 # Conditional tool registration based on environment variable
 if ENABLE_WORKING_DIRECTORY:
@@ -887,11 +930,13 @@ if ENABLE_WORKING_DIRECTORY:
             description='The agent profile to hand off to (e.g., "developer", "analyst")'
         ),
         message: str = Field(description="The message/task to send to the target agent"),
-        timeout: int = Field(
-            default=600,
-            description="Maximum time to wait for the agent to complete the task (in seconds)",
+        timeout: Optional[int] = Field(
+            default=None,
+            description=(
+                "Optional maximum wait in seconds. Omit to keep the task running until "
+                "completion, explicit cancellation, or a real terminal error."
+            ),
             ge=1,
-            le=3600,
         ),
         working_directory: Optional[str] = Field(
             default=None,
@@ -901,6 +946,9 @@ if ENABLE_WORKING_DIRECTORY:
             default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        reasoning_effort: Optional[str] = Field(
+            default=None, description=_reasoning_effort_field_desc
+        ),
         use_worktree: bool = Field(
             default=False,
             description=(
@@ -966,7 +1014,7 @@ if ENABLE_WORKING_DIRECTORY:
         Args:
             agent_profile: The agent profile for the new terminal
             message: The task/message to send
-            timeout: Maximum wait time in seconds
+            timeout: Optional maximum wait time in seconds; omitted by default
             working_directory: Optional directory path where agent should execute
             model: Optional model override (not honored by every provider)
             use_worktree: If true, isolate this handoff in its own git worktree
@@ -981,6 +1029,7 @@ if ENABLE_WORKING_DIRECTORY:
             working_directory,
             engine=engine,
             model=model,
+            reasoning_effort=reasoning_effort,
             use_worktree=use_worktree,
         )
 
@@ -992,16 +1041,21 @@ else:
             description='The agent profile to hand off to (e.g., "developer", "analyst")'
         ),
         message: str = Field(description="The message/task to send to the target agent"),
-        timeout: int = Field(
-            default=600,
-            description="Maximum time to wait for the agent to complete the task (in seconds)",
+        timeout: Optional[int] = Field(
+            default=None,
+            description=(
+                "Optional maximum wait in seconds. Omit to keep the task running until "
+                "completion, explicit cancellation, or a real terminal error."
+            ),
             ge=1,
-            le=3600,
         ),
         engine: Optional[str] = Field(
             default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        reasoning_effort: Optional[str] = Field(
+            default=None, description=_reasoning_effort_field_desc
+        ),
         use_worktree: bool = Field(
             default=False,
             description=(
@@ -1069,6 +1123,7 @@ else:
             None,
             engine=engine,
             model=model,
+            reasoning_effort=reasoning_effort,
             use_worktree=use_worktree,
         )
 
@@ -1080,17 +1135,16 @@ def _assign_impl(
     working_directory: Optional[str] = None,
     engine: Optional[str] = None,
     model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     use_worktree: bool = False,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
     Uses the server-side deferred-init path: cao-server creates the tmux
-    window and DB record synchronously (fast, <2s), then runs
-    ``provider.initialize()`` and delivers the initial message as a
-    background task. This keeps the assign() tool-call round-trip well
-    under kiro-cli 2.11's ~60s per-tool client timeout, and lets multiple
-    concurrent assigns from the same LLM turn run their init phases in
-    parallel instead of blocking one behind the other.
+    window and DB record synchronously (fast, <2s), then initializes the
+    provider in the background. Before the task can be delivered, assign
+    persists one inbox ASSIGN root; the existing inbox readiness gate submits
+    that exact row once the worker is ready.
     """
     terminal_id: Optional[str] = None
     try:
@@ -1128,27 +1182,47 @@ def _assign_impl(
         else:
             worker_message = message
 
-        # Create terminal in DEFERRED-INIT mode: cao-server returns as soon
-        # as the tmux window is up and the DB row is written; the actual
-        # provider.initialize() and initial-message delivery run as a
-        # background task on the server. The tool-call typically returns
-        # in under 2 seconds regardless of how long init takes.
+        goal_match = re.search(r"(?mi)^\s*GOAL\s*:\s*(.+?)\s*$", message)
+        goal = goal_match.group(1).strip() if goal_match else "scoped task"
+        stage_match = re.search(r"(?i)\bS[0-7](?:-[A-Za-z0-9]+)?\b", goal)
+        worker_metadata: Dict[str, Any] = {
+            "display_name": goal[:72],
+            "task_family": goal[:160],
+        }
+        if stage_match:
+            worker_metadata["project_stage"] = stage_match.group(0).upper()
+
+        # Create the terminal in DEFERRED-INIT mode without an initial message.
+        # This starts provider initialization but cannot deliver the task body
+        # ahead of the durable inbox root written immediately below.
         terminal_id, _ = _create_terminal(
             agent_profile,
             working_directory,
             engine=engine,
             defer_init=True,
-            initial_message=worker_message,
-            initial_message_orchestration_type=OrchestrationType.ASSIGN,
             model=model,
+            reasoning_effort=reasoning_effort,
             use_worktree=use_worktree,
+            metadata=worker_metadata,
         )
+        root = _send_to_inbox(
+            terminal_id,
+            worker_message,
+            orchestration_type=OrchestrationType.ASSIGN,
+        )
+        message_id = root.get("message_id")
+        task_id = root.get("task_id")
+        if not isinstance(message_id, int) or not isinstance(task_id, str) or not task_id:
+            raise RuntimeError("cao-server did not return a stable ASSIGN task/message identity")
 
         return {
             "success": True,
             "terminal_id": terminal_id,
+            "message_id": message_id,
+            "task_id": task_id,
             "message": (
-                f"Task assigned to {agent_profile} (terminal: {terminal_id}). "
+                f"Task {task_id} assigned to {agent_profile} "
+                f"(terminal: {terminal_id}, message: {message_id}). "
                 f"Worker is initializing in the background; your task will be "
                 f"delivered once it is ready. "
                 f"Call delete_terminal('{terminal_id}') when you no longer need this terminal."
@@ -1261,6 +1335,9 @@ if ENABLE_WORKING_DIRECTORY:
             default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        reasoning_effort: Optional[str] = Field(
+            default=None, description=_reasoning_effort_field_desc
+        ),
         use_worktree: bool = Field(
             default=False,
             description=(
@@ -1279,6 +1356,7 @@ if ENABLE_WORKING_DIRECTORY:
             working_directory,
             engine=engine,
             model=model,
+            reasoning_effort=reasoning_effort,
             use_worktree=use_worktree,
         )
 
@@ -1294,6 +1372,9 @@ else:
             default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        reasoning_effort: Optional[str] = Field(
+            default=None, description=_reasoning_effort_field_desc
+        ),
         use_worktree: bool = Field(
             default=False,
             description=(
@@ -1312,12 +1393,19 @@ else:
             None,
             engine=engine,
             model=model,
+            reasoning_effort=reasoning_effort,
             use_worktree=use_worktree,
         )
 
 
 # Implementation function for send_message
-def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, Any]:
+def _send_message_impl(
+    receiver_id: Optional[str],
+    message: str,
+    task_id: Optional[str] = None,
+    reply_to_message_id: Optional[int] = None,
+    review_verdict: Optional[str] = None,
+) -> Dict[str, Any]:
     """Implementation of send_message logic."""
     try:
         own_terminal_id = _current_terminal_id()
@@ -1386,7 +1474,13 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
                 "Use send_message MCP tool for any follow-up work.]"
             )
 
-        return _send_to_inbox(receiver_id, message)
+        return _send_to_inbox(
+            receiver_id,
+            message,
+            task_id=task_id,
+            reply_to_message_id=reply_to_message_id,
+            review_verdict=review_verdict,
+        )
     except requests.HTTPError as exc:
         # e.g. the receiver terminal (a recorded caller included) was deleted
         # before this reply — surface the API detail instead of a raw
@@ -1412,6 +1506,23 @@ async def send_message(
             "this one via handoff/assign (the recorded caller)."
         ),
     ),
+    task_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Stable direct-task ID. Omit for a new five-field task (CAO creates one) "
+            "or for a reply (CAO inherits the newest task connecting both terminals)."
+        ),
+    ),
+    reply_to_message_id: Optional[int] = Field(
+        default=None,
+        description="Optional inbox message ID this message replies to.",
+        ge=1,
+    ),
+    review_verdict: Optional[str] = Field(
+        default=None,
+        description="Set only for an explicit final review: ACCEPT or REJECT.",
+        pattern="^(ACCEPT|REJECT)$",
+    ),
 ) -> Dict[str, Any]:
     """Send a message to another terminal's inbox.
 
@@ -1429,7 +1540,13 @@ async def send_message(
     Returns:
         Dict with success status and message details
     """
-    return _send_message_impl(receiver_id, message)
+    return _send_message_impl(
+        receiver_id,
+        message,
+        task_id=task_id,
+        reply_to_message_id=reply_to_message_id,
+        review_verdict=review_verdict,
+    )
 
 
 @mcp.tool()

@@ -911,6 +911,26 @@ class TestCodexProviderCodexConfig:
         assert "mcp_servers.cao-mcp-server.command=" in command
         assert 'model_reasoning_effort="xhigh"' in command
 
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_task_effort_is_emitted_after_profile_default(self, mock_load):
+        """The per-launch effort wins without mutating the named profile."""
+        mock_profile = MagicMock()
+        mock_profile.model = "gpt-5.6-sol"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {"model_reasoning_effort": "high"}
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", reasoning_effort="xhigh")
+        command = provider._build_codex_command()
+
+        profile_default = 'model_reasoning_effort="high"'
+        task_override = 'model_reasoning_effort="xhigh"'
+        assert profile_default in command
+        assert task_override in command
+        assert command.index(task_override) > command.index(profile_default)
+
 
 class TestCodexProviderStatusDetection:
     def test_get_status_idle(self):
@@ -1116,6 +1136,7 @@ class TestCodexRenderedScreenStatusDetection:
         provider = CodexProvider("test1234", "test-session", "window-0")
 
         assert provider.supports_screen_detection is True
+        assert provider.supports_direct_status_probe is True
 
     def test_blank_rendered_screen_is_unknown(self):
         provider = CodexProvider("test1234", "test-session", "window-0")
@@ -1154,6 +1175,44 @@ class TestCodexRenderedScreenStatusDetection:
         provider = CodexProvider("test1234", "test-session", "window-0")
 
         assert provider.get_status_from_screen(screen_lines) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize("glyph", ["•", "◦"])
+    def test_codex_0149_progress_glyphs_are_processing(self, glyph):
+        screen_lines = [
+            "› Complete the delegated capability canary",
+            "• Called cao-mcp-server.load_skill({})",
+            f"{glyph} Working (10s • esc to interrupt)",
+            "",
+            "› Ask Codex to do anything",
+            "",
+            "  gpt-5.6-sol high · /tmp/project",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.PROCESSING
+
+    def test_codex_0149_idle_placeholder_is_ready(self):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert (
+            provider.get_status_from_screen(
+                ["» Ask Codex to do anything", "", "  gpt-5.6-sol high · /tmp/project"]
+            )
+            == TerminalStatus.IDLE
+        )
+
+    def test_codex_0149_completed_turn_is_completed(self):
+        screen_lines = [
+            "» Reply with the readiness token",
+            "• CAO_CODEX_READY",
+            "",
+            "» Ask Codex to do anything",
+            "",
+            "  gpt-5.6-sol high · /tmp/project",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.COMPLETED
 
     @pytest.mark.parametrize("elapsed", ["1m 00s", "1h 00m 00s"])
     def test_minute_plus_live_progress_is_processing(self, elapsed):
@@ -1535,6 +1594,25 @@ class TestCodexV0136FooterFormat:
         assert "def greet(name):" in message
         assert "Hello, {name}!" in message
         assert "Run /review" not in message
+
+    def test_extract_last_message_v0149_composer(self):
+        """Extraction recognizes the v0.149 prompt and excludes its composer."""
+        script_output = (
+            "» Summarize the fix.\n"
+            "• Added Codex 0.149 composer support.\n"
+            "  All targeted tests pass.\n"
+            "\n"
+            "» Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol high · /tmp/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(script_output)
+
+        assert "Added Codex 0.149 composer support." in message
+        assert "All targeted tests pass." in message
+        assert "Ask Codex to do anything" not in message
 
 
 class TestCodexProviderMessageExtraction:
@@ -2132,6 +2210,14 @@ class TestCodexProviderTrustPrompt:
         output = (
             f"OpenAI Codex (v0.145.0)\n› {placeholder}\n"
             "  gpt-5.6-sol medium · Context 100% left\n"
+        )
+
+        assert _has_startup_idle_composer(output) is True
+
+    def test_v0149_idle_composer_placeholder(self):
+        output = (
+            "OpenAI Codex (v0.149.0)\n» Ask Codex to do anything\n"
+            "  gpt-5.6-sol high · Context 100% left\n"
         )
 
         assert _has_startup_idle_composer(output) is True

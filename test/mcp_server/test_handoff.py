@@ -232,6 +232,20 @@ class TestHandoffOutcomes:
 
     @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_default_handoff_has_no_overall_wall_clock_cap(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("claude_code")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task"))
+
+        assert result.success is True
+        assert "timeout" not in mock_requests.post.call_args.kwargs["json"]
+        assert mock_requests.post.call_args.kwargs["timeout"] is None
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_use_worktree_true_reaches_the_payload(self, mock_provider, _nudge):
         mock_provider.return_value = _ctx("kiro_cli")
 
@@ -427,6 +441,18 @@ class TestHandoffModelOverride:
         assert result.success is True
         payload = mock_requests.post.call_args[1]["json"]
         assert "model" not in payload
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_reasoning_effort_is_forwarded_in_payload(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx(provider="claude_code")
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.post") as mock_post:
+            mock_post.return_value = _ok_run_step_response()
+            result = asyncio.run(_handoff_impl("developer", "Do task", reasoning_effort="xhigh"))
+
+        assert result.success is True
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["reasoning_effort"] == "xhigh"
 
 
 class TestResolveHandoffProvider:

@@ -39,7 +39,7 @@ from cli_agent_orchestrator.clients.database import (
     update_terminal_metadata,
     update_terminal_shell_command,
 )
-from cli_agent_orchestrator.models.inbox import MessageStatus
+from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 
 
 @pytest.fixture
@@ -1061,6 +1061,195 @@ class TestInboxOperations:
 
         mock_session.commit.assert_called_once()
 
+    def test_direct_task_lifecycle_round_trips_through_real_db(self, test_db):
+        """Five-field dispatches, replies, and explicit review share one task."""
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("architect", "cao-s", "architect", "codex")
+            create_terminal("worker", "cao-s", "worker", "claude_code")
+
+            root = create_inbox_message(
+                "architect",
+                "worker",
+                "GOAL: implement\nEFFORT: high\nSCOPE: src\n"
+                "STOP WHEN: tests fail\nRETURN: diff and tests",
+                orchestration_type=OrchestrationType.ASSIGN,
+            )
+            assert root.task_id == f"direct-{root.id}"
+            assert root.reply_to_message_id is None
+            assert root.orchestration_type == OrchestrationType.ASSIGN
+
+            assert update_message_status(root.id, MessageStatus.DELIVERED) is True
+            returned = create_inbox_message("worker", "architect", "Implemented; tests pass.")
+            assert returned.task_id == root.task_id
+            assert returned.reply_to_message_id == root.id
+            assert returned.orchestration_type == OrchestrationType.SEND_MESSAGE
+
+            reviewed = create_inbox_message(
+                "architect",
+                "worker",
+                "Reviewed the real diff and test output.",
+                task_id=root.task_id,
+                reply_to_message_id=returned.id,
+                review_verdict="ACCEPT",
+            )
+            assert reviewed.task_id == root.task_id
+            assert reviewed.reply_to_message_id == returned.id
+            assert reviewed.review_verdict == "ACCEPT"
+
+            worker_inbox = get_inbox_messages("worker", limit=10)
+            architect_inbox = get_inbox_messages("architect", limit=10)
+
+        persisted_root = next(message for message in worker_inbox if message.id == root.id)
+        assert persisted_root.delivered_at is not None
+        assert persisted_root.started_at is None
+        assert persisted_root.reviewed_at is not None
+        assert persisted_root.review_verdict == "ACCEPT"
+        assert architect_inbox[0].message == "Implemented; tests pass."
+
+    def test_review_requires_exactly_one_assign_root(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("architect", "cao-s", "architect", "codex")
+            create_terminal("worker", "cao-s", "worker", "claude_code")
+
+            with pytest.raises(ValueError, match="exactly one ASSIGN root"):
+                create_inbox_message(
+                    "architect",
+                    "worker",
+                    "Reviewed.",
+                    task_id="missing-task",
+                    review_verdict="ACCEPT",
+                )
+
+            with test_db() as seed:
+                for message in ("root one", "root two"):
+                    seed.add(
+                        InboxModel(
+                            sender_id="architect",
+                            receiver_id="worker",
+                            message=message,
+                            status=MessageStatus.DELIVERED.value,
+                            orchestration_type=OrchestrationType.ASSIGN.value,
+                            task_id="duplicate-task",
+                        )
+                    )
+                seed.commit()
+
+            with pytest.raises(ValueError, match="found 2"):
+                create_inbox_message(
+                    "architect",
+                    "worker",
+                    "Reviewed.",
+                    task_id="duplicate-task",
+                    review_verdict="REJECT",
+                )
+
+    def test_reply_parent_must_share_task_and_conversation(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("architect", "cao-s", "architect", "codex")
+            create_terminal("worker-a", "cao-s", "worker-a", "claude_code")
+            create_terminal("worker-b", "cao-s", "worker-b", "claude_code")
+            root_a = create_inbox_message(
+                "architect",
+                "worker-a",
+                "task a",
+                task_id="task-a",
+                orchestration_type=OrchestrationType.ASSIGN,
+            )
+            root_b = create_inbox_message(
+                "architect",
+                "worker-b",
+                "task b",
+                task_id="task-b",
+                orchestration_type=OrchestrationType.ASSIGN,
+            )
+
+            with pytest.raises(ValueError, match="already exists"):
+                create_inbox_message(
+                    "architect",
+                    "worker-a",
+                    "duplicate root",
+                    task_id=root_a.task_id,
+                    orchestration_type=OrchestrationType.ASSIGN,
+                )
+
+            with pytest.raises(ValueError, match="conflicts with reply_to_message_id"):
+                create_inbox_message(
+                    "worker-a",
+                    "architect",
+                    "wrong parent task",
+                    task_id=root_a.task_id,
+                    reply_to_message_id=root_b.id,
+                )
+
+            with pytest.raises(ValueError, match="do not belong"):
+                create_inbox_message(
+                    "worker-b",
+                    "architect",
+                    "wrong conversation",
+                    task_id=root_a.task_id,
+                    reply_to_message_id=root_a.id,
+                )
+
+    def test_only_assigning_side_can_review(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("architect", "cao-s", "architect", "codex")
+            create_terminal("worker", "cao-s", "worker", "claude_code")
+            root = create_inbox_message(
+                "architect",
+                "worker",
+                "task",
+                orchestration_type=OrchestrationType.ASSIGN,
+            )
+
+            with pytest.raises(ValueError, match="Only the assigning side"):
+                create_inbox_message(
+                    "worker",
+                    "architect",
+                    "Self accepted.",
+                    task_id=root.task_id,
+                    reply_to_message_id=root.id,
+                    review_verdict="ACCEPT",
+                )
+
+    def test_failed_delivery_clears_delivery_and_start_timestamps(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("worker", "cao-s", "worker", "claude_code")
+            message = create_inbox_message("architect", "worker", "routine update")
+            update_message_status(message.id, MessageStatus.DELIVERED)
+            update_message_status(message.id, MessageStatus.FAILED)
+            persisted = get_inbox_messages("worker", limit=10)[0]
+
+        assert persisted.status == MessageStatus.FAILED
+        assert persisted.delivered_at is None
+        assert persisted.started_at is None
+
+    def test_newest_window_is_selected_but_returned_chronologically(self, test_db):
+        with test_db() as seed:
+            seed.add(
+                TerminalModel(
+                    id="worker",
+                    tmux_session="cao-s",
+                    tmux_window="worker",
+                    provider="claude_code",
+                )
+            )
+            for index in range(5):
+                seed.add(
+                    InboxModel(
+                        sender_id="architect",
+                        receiver_id="worker",
+                        message=f"message-{index}",
+                        status=MessageStatus.DELIVERED.value,
+                        created_at=datetime(2026, 8, 23, 10, index, 0),
+                    )
+                )
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages("worker", limit=2, newest_first=True)
+
+        assert [message.message for message in messages] == ["message-3", "message-4"]
+
 
 class TestFlowOperations:
     """Tests for flow database operations."""
@@ -1412,6 +1601,68 @@ class TestInitDb:
         init_db()
 
         mock_base.metadata.create_all.assert_called_once()
+
+
+class TestInboxLifecycleSchemaMigration:
+    """Direct-task lifecycle migration preserves old inbox evidence."""
+
+    def test_adds_columns_and_backfills_only_five_field_roots_idempotently(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "legacy-inbox.db"
+        task_body = (
+            "GOAL: old task\nEFFORT: high\nSCOPE: src\n" "STOP WHEN: tests fail\nRETURN: report"
+        )
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE inbox ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, sender_id TEXT NOT NULL, "
+                "receiver_id TEXT NOT NULL, message TEXT NOT NULL, "
+                "status TEXT NOT NULL, created_at DATETIME)"
+            )
+            conn.executemany(
+                "INSERT INTO inbox (sender_id, receiver_id, message, status) "
+                "VALUES (?, ?, ?, 'delivered')",
+                [
+                    ("architect", "worker", task_body),
+                    ("worker", "architect", "old result"),
+                ],
+            )
+            conn.commit()
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+        db_mod._migrate_inbox_lifecycle_schema()
+        db_mod._migrate_inbox_lifecycle_schema()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(inbox)")]
+            rows = conn.execute(
+                "SELECT id, message, orchestration_type, task_id, "
+                "reply_to_message_id FROM inbox ORDER BY id"
+            ).fetchall()
+            indexes = {row[1] for row in conn.execute("PRAGMA index_list(inbox)")}
+
+        for column in (
+            "orchestration_type",
+            "task_id",
+            "reply_to_message_id",
+            "delivered_at",
+            "started_at",
+            "reviewed_at",
+            "review_verdict",
+        ):
+            assert columns.count(column) == 1
+        assert rows == [
+            (1, task_body, "assign", "legacy-direct-1", None),
+            (2, "old result", None, None, None),
+        ]
+        assert {"idx_inbox_task_id", "idx_inbox_reply_to_message_id"} <= indexes
 
 
 class TestTerminalsSchemaMigration:

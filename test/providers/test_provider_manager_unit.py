@@ -84,6 +84,34 @@ def test_get_provider_creates_on_demand_from_metadata():
     assert manager.get_provider("t1") is provider
 
 
+def test_get_provider_restores_launch_policy_from_nested_metadata():
+    manager = ProviderManager()
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value={
+                "provider": ProviderType.CLAUDE_CODE.value,
+                "tmux_session": "s1",
+                "tmux_window": "w1",
+                "agent_profile": "worker",
+                "allowed_tools": ["*"],
+                "metadata": {
+                    "launch_model": "claude-fable-5",
+                    "launch_reasoning_effort": "medium",
+                },
+            },
+        ),
+        patch.object(manager, "create_provider", wraps=manager.create_provider) as create,
+    ):
+        provider = manager.get_provider("t1")
+
+    assert provider._model == "claude-fable-5"
+    assert provider._reasoning_effort == "medium"
+    assert provider._allowed_tools == ["*"]
+    assert create.call_args.kwargs["model"] == "claude-fable-5"
+    assert create.call_args.kwargs["reasoning_effort"] == "medium"
+
+
 def test_get_provider_creates_copilot_on_demand_from_metadata():
     manager = ProviderManager()
 

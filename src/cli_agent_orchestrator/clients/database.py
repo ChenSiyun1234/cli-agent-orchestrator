@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, cast
@@ -16,13 +17,15 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    and_,
     create_engine,
+    or_,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
-from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,13 @@ class InboxModel(Base):
     message = Column(String, nullable=False)
     status = Column(String, nullable=False)  # MessageStatus enum value
     created_at = Column(DateTime, default=datetime.now)
+    orchestration_type = Column(String, nullable=True)
+    task_id = Column(String, nullable=True)
+    reply_to_message_id = Column(Integer, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    review_verdict = Column(String, nullable=True)
 
 
 def _utcnow() -> datetime:
@@ -298,6 +308,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
+    _migrate_inbox_lifecycle_schema()
     _migrate_memory_indexes()
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
@@ -1020,6 +1031,58 @@ def _migrate_terminals_schema() -> None:
         logger.warning(f"Migration check for terminals schema failed: {e}")
 
 
+def _migrate_inbox_lifecycle_schema() -> None:
+    """Add direct-task lifecycle columns without rewriting message bodies.
+
+    Existing five-field task dispatches receive a ``legacy-direct-*`` identity
+    so the web UI can group them while still labelling their linkage as
+    historical.  Other legacy messages stay unbound; the UI may show a
+    time-window inference, but the database never fabricates a reply edge.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    additions = {
+        "orchestration_type": "TEXT",
+        "task_id": "TEXT",
+        "reply_to_message_id": "INTEGER",
+        "delivered_at": "DATETIME",
+        "started_at": "DATETIME",
+        "reviewed_at": "DATETIME",
+        "review_verdict": "TEXT",
+    }
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(inbox)")}
+            for name, sql_type in additions.items():
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE inbox ADD COLUMN {name} {sql_type}")
+                    logger.info("Migration: added %s column to inbox table", name)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_inbox_task_id ON inbox (task_id)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_inbox_reply_to_message_id "
+                "ON inbox (reply_to_message_id)"
+            )
+            for message_id, body, task_id, reply_to_message_id in conn.execute(
+                "SELECT id, message, task_id, reply_to_message_id FROM inbox "
+                "WHERE orchestration_type IS NULL OR task_id IS NULL ORDER BY id"
+            ):
+                if reply_to_message_id is None and _looks_like_five_field_task(body):
+                    if task_id is None:
+                        conn.execute(
+                            "UPDATE inbox SET task_id = ? WHERE id = ? AND task_id IS NULL",
+                            (f"legacy-direct-{message_id}", message_id),
+                        )
+                    conn.execute(
+                        "UPDATE inbox SET orchestration_type = ? "
+                        "WHERE id = ? AND orchestration_type IS NULL",
+                        (OrchestrationType.ASSIGN.value, message_id),
+                    )
+    except Exception as e:
+        logger.warning(f"Migration check for inbox lifecycle schema failed: {e}")
+
+
 def create_terminal(
     terminal_id: str,
     tmux_session: str,
@@ -1373,32 +1436,274 @@ def delete_terminals_by_session(tmux_session: str) -> int:
         return deleted
 
 
-def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
+_FIVE_FIELD_HEADER_RE = re.compile(
+    r"(?im)^\s*(GOAL|EFFORT|SCOPE|STOP\s+WHEN|RETURN)\s*:",
+)
+
+
+def _looks_like_five_field_task(message: object) -> bool:
+    """Return True only when all five lightweight task headers are present."""
+    if not isinstance(message, str):
+        return False
+    headers = {
+        re.sub(r"\s+", " ", match.group(1).upper())
+        for match in _FIVE_FIELD_HEADER_RE.finditer(message)
+    }
+    return headers == {"GOAL", "EFFORT", "SCOPE", "STOP WHEN", "RETURN"}
+
+
+def _normalize_task_id(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("task_id must not be empty")
+    if len(normalized) > 200:
+        raise ValueError("task_id must be at most 200 characters")
+    return normalized
+
+
+def _normalize_review_verdict(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = value.strip().upper()
+    if normalized not in {"ACCEPT", "REJECT"}:
+        raise ValueError("review_verdict must be ACCEPT or REJECT")
+    return normalized
+
+
+def _normalize_orchestration_type(
+    value: Optional[OrchestrationType | str],
+) -> Optional[OrchestrationType]:
+    if value is None:
+        return None
+    try:
+        return value if isinstance(value, OrchestrationType) else OrchestrationType(value)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in OrchestrationType)
+        raise ValueError(f"orchestration_type must be one of: {allowed}") from exc
+
+
+def _typed_optional(row: Any, name: str, expected: Any) -> Any:
+    value = getattr(row, name, None)
+    return value if isinstance(value, expected) else None
+
+
+def _typed_orchestration_type(row: Any) -> Optional[OrchestrationType]:
+    value = _typed_optional(row, "orchestration_type", str)
+    if value is None:
+        return None
+    try:
+        return OrchestrationType(value)
+    except ValueError:
+        return None
+
+
+def _inbox_message_from_row(row: InboxModel) -> InboxMessage:
+    return InboxMessage(
+        id=row.id,
+        sender_id=row.sender_id,
+        receiver_id=row.receiver_id,
+        message=row.message,
+        status=MessageStatus(row.status),
+        created_at=row.created_at,
+        orchestration_type=_typed_orchestration_type(row),
+        task_id=_typed_optional(row, "task_id", str),
+        reply_to_message_id=_typed_optional(row, "reply_to_message_id", int),
+        delivered_at=_typed_optional(row, "delivered_at", datetime),
+        started_at=_typed_optional(row, "started_at", datetime),
+        reviewed_at=_typed_optional(row, "reviewed_at", datetime),
+        review_verdict=_typed_optional(row, "review_verdict", str),
+    )
+
+
+def _direct_task_roots(db: Any, task_id: str) -> List[Any]:
+    """Return every observed ASSIGN root for one stable direct-task ID."""
+    return cast(
+        List[Any],
+        (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.task_id == task_id,
+                InboxModel.reply_to_message_id.is_(None),
+                InboxModel.orchestration_type == OrchestrationType.ASSIGN.value,
+            )
+            .order_by(InboxModel.id.asc())
+            .all()
+        ),
+    )
+
+
+def _latest_direct_task_root(db: Any, sender_id: str, receiver_id: str) -> Any:
+    """Find the newest root task connecting two terminals in either direction."""
+    return (
+        db.query(InboxModel)
+        .filter(
+            InboxModel.task_id.isnot(None),
+            InboxModel.reply_to_message_id.is_(None),
+            InboxModel.orchestration_type == OrchestrationType.ASSIGN.value,
+            or_(
+                and_(
+                    InboxModel.sender_id == sender_id,
+                    InboxModel.receiver_id == receiver_id,
+                ),
+                and_(
+                    InboxModel.sender_id == receiver_id,
+                    InboxModel.receiver_id == sender_id,
+                ),
+            ),
+        )
+        .order_by(InboxModel.id.desc())
+        .first()
+    )
+
+
+def _same_direct_task_conversation(
+    root: Any,
+    sender_id: str,
+    receiver_id: str,
+) -> bool:
+    """Return whether endpoints are either direction of the root conversation."""
+    return bool(
+        (sender_id == root.sender_id and receiver_id == root.receiver_id)
+        or (sender_id == root.receiver_id and receiver_id == root.sender_id)
+    )
+
+
+def _require_single_direct_task_root(db: Any, task_id: str) -> Any:
+    roots = _direct_task_roots(db, task_id)
+    if len(roots) != 1:
+        raise ValueError(
+            f"Direct task '{task_id}' must have exactly one ASSIGN root; found {len(roots)}"
+        )
+    return roots[0]
+
+
+def create_inbox_message(
+    sender_id: str,
+    receiver_id: str,
+    message: str,
+    task_id: Optional[str] = None,
+    reply_to_message_id: Optional[int] = None,
+    review_verdict: Optional[str] = None,
+    orchestration_type: Optional[OrchestrationType | str] = None,
+) -> InboxMessage:
     """Create inbox message with status=MessageStatus.PENDING.
 
     Raises:
         ValueError: If the receiver terminal does not exist.
     """
+    normalized_task_id = _normalize_task_id(task_id)
+    normalized_verdict = _normalize_review_verdict(review_verdict)
+    normalized_orchestration_type = _normalize_orchestration_type(orchestration_type)
     with SessionLocal() as db:
         if not db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first():
             raise ValueError(f"Terminal '{receiver_id}' not found")
+
+        is_task_root = normalized_orchestration_type == OrchestrationType.ASSIGN or (
+            normalized_orchestration_type is None and _looks_like_five_field_task(message)
+        )
+        if is_task_root:
+            normalized_orchestration_type = OrchestrationType.ASSIGN
+            if reply_to_message_id is not None:
+                raise ValueError("An ASSIGN root cannot reply to another inbox message")
+            if normalized_verdict is not None:
+                raise ValueError("An ASSIGN root cannot carry a review verdict")
+            if normalized_task_id is not None:
+                existing_rows = (
+                    db.query(InboxModel)
+                    .filter(InboxModel.task_id == normalized_task_id)
+                    .order_by(InboxModel.id.asc())
+                    .all()
+                )
+                if existing_rows:
+                    raise ValueError(f"Direct task '{normalized_task_id}' already exists")
+
+            inbox_msg = InboxModel(
+                sender_id=sender_id,
+                receiver_id=receiver_id,
+                message=message,
+                status=MessageStatus.PENDING.value,
+                orchestration_type=normalized_orchestration_type.value,
+                task_id=normalized_task_id,
+                reply_to_message_id=None,
+                review_verdict=None,
+            )
+            db.add(inbox_msg)
+            db.flush()
+            if normalized_task_id is None:
+                inbox_msg.task_id = f"direct-{inbox_msg.id}"
+            db.commit()
+            db.refresh(inbox_msg)
+            return _inbox_message_from_row(inbox_msg)
+
+        normalized_orchestration_type = (
+            normalized_orchestration_type or OrchestrationType.SEND_MESSAGE
+        )
+        parent: Any = None
+        if reply_to_message_id is not None:
+            parent = db.query(InboxModel).filter(InboxModel.id == reply_to_message_id).first()
+            if parent is None:
+                raise ValueError(f"Inbox message '{reply_to_message_id}' not found")
+            parent_task_id = _typed_optional(parent, "task_id", str)
+            if parent_task_id is None:
+                raise ValueError("reply_to_message_id does not belong to a direct task")
+            if normalized_task_id and normalized_task_id != parent_task_id:
+                raise ValueError("task_id conflicts with reply_to_message_id")
+            normalized_task_id = normalized_task_id or parent_task_id
+
+        if normalized_task_id is None:
+            inferred_root = _latest_direct_task_root(db, sender_id, receiver_id)
+            inferred_task_id = _typed_optional(inferred_root, "task_id", str)
+            if inferred_task_id:
+                normalized_task_id = inferred_task_id
+                if reply_to_message_id is None:
+                    reply_to_message_id = _typed_optional(inferred_root, "id", int)
+
+        root: Any = None
+        if normalized_task_id is not None:
+            root = _require_single_direct_task_root(db, normalized_task_id)
+            if not _same_direct_task_conversation(root, sender_id, receiver_id):
+                raise ValueError("Message endpoints do not belong to the direct-task conversation")
+            if parent is not None:
+                parent_task_id = _typed_optional(parent, "task_id", str)
+                if parent_task_id != normalized_task_id:
+                    raise ValueError("reply_to_message_id belongs to a different task")
+                if not _same_direct_task_conversation(
+                    root,
+                    parent.sender_id,
+                    parent.receiver_id,
+                ):
+                    raise ValueError("reply_to_message_id belongs to a different conversation")
+            if reply_to_message_id is None:
+                reply_to_message_id = _typed_optional(root, "id", int)
+
+        if normalized_verdict is not None:
+            if normalized_task_id is None or root is None:
+                raise ValueError("A review verdict requires exactly one existing ASSIGN root")
+            if sender_id != root.sender_id or receiver_id != root.receiver_id:
+                raise ValueError("Only the assigning side may ACCEPT or REJECT a direct task")
+
         inbox_msg = InboxModel(
             sender_id=sender_id,
             receiver_id=receiver_id,
             message=message,
             status=MessageStatus.PENDING.value,
+            orchestration_type=normalized_orchestration_type.value,
+            task_id=normalized_task_id,
+            reply_to_message_id=reply_to_message_id,
+            review_verdict=normalized_verdict,
         )
         db.add(inbox_msg)
+        db.flush()
+
+        if normalized_verdict is not None and root is not None:
+            reviewed_at = datetime.now()
+            root.review_verdict = normalized_verdict
+            root.reviewed_at = reviewed_at
         db.commit()
         db.refresh(inbox_msg)
-        return InboxMessage(
-            id=inbox_msg.id,
-            sender_id=inbox_msg.sender_id,
-            receiver_id=inbox_msg.receiver_id,
-            message=inbox_msg.message,
-            status=MessageStatus(inbox_msg.status),
-            created_at=inbox_msg.created_at,
-        )
+        return _inbox_message_from_row(inbox_msg)
 
 
 def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:
@@ -1407,14 +1712,20 @@ def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]
 
 
 def get_inbox_messages(
-    receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
+    receiver_id: str,
+    limit: int = 10,
+    status: Optional[MessageStatus] = None,
+    newest_first: bool = False,
 ) -> List[InboxMessage]:
-    """Get inbox messages with optional status filter ordered by created_at ASC (oldest first).
+    """Get inbox messages with an optional newest-window read.
 
     Args:
         receiver_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10)
         status: Optional filter by message status (None = all statuses)
+        newest_first: Select the newest ``limit`` rows, then return that window
+            in chronological order. The default preserves the original oldest-
+            first queue behavior.
 
     Returns:
         List of inbox messages ordered by creation time (oldest first)
@@ -1425,19 +1736,12 @@ def get_inbox_messages(
         if status is not None:
             query = query.filter(InboxModel.status == status.value)
 
-        messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
+        order = InboxModel.created_at.desc() if newest_first else InboxModel.created_at.asc()
+        messages = query.order_by(order).limit(limit).all()
+        if newest_first:
+            messages.reverse()
 
-        return [
-            InboxMessage(
-                id=msg.id,
-                sender_id=msg.sender_id,
-                receiver_id=msg.receiver_id,
-                message=msg.message,
-                status=MessageStatus(msg.status),
-                created_at=msg.created_at,
-            )
-            for msg in messages
-        ]
+        return [_inbox_message_from_row(msg) for msg in messages]
 
 
 def record_project_alias(project_id: str, alias: str, kind: str) -> None:
@@ -1501,6 +1805,12 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
         message = db.query(InboxModel).filter(InboxModel.id == message_id).first()
         if message:
             message.status = status.value
+            if status == MessageStatus.DELIVERED:
+                message.delivered_at = datetime.now()
+                message.started_at = None
+            else:
+                message.delivered_at = None
+                message.started_at = None
             db.commit()
             return True
         return False

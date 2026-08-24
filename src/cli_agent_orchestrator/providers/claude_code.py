@@ -253,6 +253,7 @@ class ClaudeCodeProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
@@ -262,12 +263,14 @@ class ClaudeCodeProvider(BaseProvider):
         # --model resolution below) -- e.g. a handoff/assign caller pinning a
         # specific model for one worker without needing a dedicated profile.
         self._model = model
+        self._reasoning_effort = reasoning_effort
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
         self._input_generation: int = 0
         self._snapshot_tail_hash: Optional[str] = None
         self._snapshot_last_response: Optional[str] = None
         self._snapshot_response_count: int = 0
+        self._input_snapshot_prepared = False
 
     @staticmethod
     def _tail_hash(output: str, n: int = 30) -> str:
@@ -372,18 +375,13 @@ class ClaudeCodeProvider(BaseProvider):
         native = getattr(profile, "native_agent", None) if profile else None
         if profile is not None and isinstance(native, str) and native:
             # Thin wrapper: CAO profile maps to a native Claude Code agent.
-            # Let Claude Code handle all config (MCP servers, hooks, tools, model)
-            # -- self._model (whether sourced from an explicit per-call override
-            # or from this same profile's own model field, see
-            # terminal_service.create_terminal's own precedence resolution) is
-            # deliberately NOT applied here, same as it was never applied for
-            # profile.model alone before this parameter existed. Not warned on:
-            # by the time this runs, self._model can no longer be distinguished
-            # from "this profile's own model field, nothing to do with a caller
-            # override at all" -- warning here would misattribute ordinary
-            # profile config as an ignored explicit request.
+            # Claude Code handles the native agent's MCP/hooks/tools config.
+            # CAO still applies its resolved model explicitly so launch metadata
+            # and the process command cannot disagree.
             # CAO_TERMINAL_ID propagates via tmux pane env inheritance.
             command_parts.extend(["--agent", native])
+            if self._model:
+                command_parts.extend(["--model", self._model])
         elif self._agent_profile is not None and profile is None:
             # No CAO profile exists — pass agent name directly to Claude Code's
             # native agent store (~/.claude/agents/). Same thin-orchestrator
@@ -455,6 +453,9 @@ class ClaudeCodeProvider(BaseProvider):
                         "--strict-mcp-config",
                     ]
                 )
+
+        if self._reasoning_effort:
+            command_parts.extend(["--effort", self._reasoning_effort])
 
         # Apply tool restrictions via --disallowedTools flags.
         # --dangerously-skip-permissions bypasses prompts but --disallowedTools
@@ -1206,19 +1207,42 @@ class ClaudeCodeProvider(BaseProvider):
         """
         return True
 
-    def mark_input_received(self) -> None:
-        """Capture content-based snapshots for the staleness guard (issue #407).
+    def _capture_input_snapshot(self) -> None:
+        """Capture the current pane as the baseline for the next input."""
 
-        Uses tail-hash instead of raw length because the tmux sliding window
-        is not monotonically growing.
-        """
         output = get_backend().get_history(self.session_name, self.window_name) or ""
         self._snapshot_tail_hash = self._tail_hash(output, self._TAIL_HASH_LINES)
         self._snapshot_last_response = self._extract_last_response_text(output)
         clean = self._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
         self._snapshot_response_count = len(list(re.finditer(r"[⏺●]\s+", clean)))
+
+    def prepare_input_delivery(self) -> None:
+        """Snapshot the previous turn before bracketed paste can finish quickly."""
+
+        self._capture_input_snapshot()
+        self._input_snapshot_prepared = True
+
+    def mark_input_received(self) -> None:
+        """Commit content-based staleness tracking after successful delivery.
+
+        Uses tail-hash instead of raw length because the tmux sliding window
+        is not monotonically growing.  ``terminal_service.send_input`` prepares
+        the baseline before ``send_keys``; the fallback capture preserves direct
+        callers that only use this historical post-send hook.
+        """
+
+        if not self._input_snapshot_prepared:
+            self._capture_input_snapshot()
+        self._input_snapshot_prepared = False
         self._input_generation += 1
         super().mark_input_received()
+
+    def confirms_current_turn_completion(self, output: str) -> bool:
+        """Authenticate a fast completed frame against the pre-send baseline."""
+
+        if self._input_generation <= 0 or not output:
+            return False
+        return self.get_status(output) == TerminalStatus.COMPLETED
 
     def get_idle_pattern_for_log(self) -> str:
         """Return Claude Code IDLE prompt pattern for log files."""

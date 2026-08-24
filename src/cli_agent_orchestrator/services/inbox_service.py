@@ -67,9 +67,9 @@ class InboxService:
         Delivery normally happens on IDLE/COMPLETED; providers that accept input
         mid-turn (``accepts_input_while_processing``) also receive messages while
         PROCESSING/WAITING_USER_ANSWER when ``EAGER_INBOX_DELIVERY`` is on (#251).
-        When a plugin registry is supplied, the originating sender and a
-        ``send_message`` orchestration type are threaded to ``terminal_service``
-        so ``PostSendMessageEvent`` hooks fire with correct attribution.
+        The persisted originating sender and orchestration type are threaded to
+        ``terminal_service`` whenever plugin attribution or an ASSIGN/HANDOFF
+        input guard needs them.
         """
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
@@ -102,16 +102,26 @@ class InboxService:
         for message in messages:
             update_message_status(message.id, MessageStatus.DELIVERED)
 
-        # Deliver in contiguous runs of the same sender. With the default
+        # Deliver in contiguous runs of the same sender and delivery mode. With the default
         # num_messages=1 this is a single run; when draining all pending messages
-        # (num_messages=0) a batch can span multiple senders, so each run is sent
-        # separately to keep PostSendMessageEvent attribution correct — otherwise
-        # every message would be attributed to messages[0].sender_id.
-        for sender_id, group in groupby(messages, key=lambda m: m.sender_id):
+        # (num_messages=0) a batch can span multiple senders or orchestration
+        # types, so each run is sent separately to keep plugin attribution and
+        # ASSIGN/HANDOFF input guards truthful.
+        for (sender_id, orchestration_type), group in groupby(
+            messages,
+            key=lambda message: (
+                message.sender_id,
+                (
+                    message.orchestration_type
+                    if isinstance(message.orchestration_type, OrchestrationType)
+                    else OrchestrationType.SEND_MESSAGE
+                ),
+            ),
+        ):
             batch = list(group)
             combined = "\n".join(m.message for m in batch)
             try:
-                if registry is None:
+                if registry is None and orchestration_type == OrchestrationType.SEND_MESSAGE:
                     terminal_service.send_input(terminal_id, combined)
                 else:
                     terminal_service.send_input(
@@ -119,7 +129,7 @@ class InboxService:
                         combined,
                         registry=registry,
                         sender_id=sender_id,
-                        orchestration_type=OrchestrationType.SEND_MESSAGE,
+                        orchestration_type=orchestration_type,
                     )
                 logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
             except TerminalNotFoundError as e:

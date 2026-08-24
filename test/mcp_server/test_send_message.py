@@ -120,6 +120,30 @@ class TestSendMessageSenderIdInjection:
         assert sent_message.startswith(original)
         assert sent_message.index("[Message from terminal") > len(original)
 
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
+    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    def test_direct_task_lifecycle_metadata_reaches_inbox_gateway(self, mock_inbox):
+        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+
+        mock_inbox.return_value = {"success": True}
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "deadbeef"}):
+            result = _send_message_impl(
+                "c0ffee01",
+                "Reviewed.",
+                task_id="direct-101",
+                reply_to_message_id=101,
+                review_verdict="ACCEPT",
+            )
+
+        assert result == {"success": True}
+        mock_inbox.assert_called_once_with(
+            "c0ffee01",
+            "Reviewed.",
+            task_id="direct-101",
+            reply_to_message_id=101,
+            review_verdict="ACCEPT",
+        )
+
 
 class TestSendMessageCallerDefault:
     """Tests for receiver_id defaulting to the recorded caller (issue #284).

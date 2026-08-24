@@ -38,6 +38,7 @@ class ProviderManager:
         allowed_tools: Optional[List[str]] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
         engine: Optional[KiroEngine] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
@@ -67,6 +68,7 @@ class ProviderManager:
                     allowed_tools,
                     skill_prompt=skill_prompt,
                     model=model,
+                    reasoning_effort=reasoning_effort,
                 )
             elif provider_type == ProviderType.CODEX.value:
                 provider = CodexProvider(
@@ -77,6 +79,7 @@ class ProviderManager:
                     allowed_tools,
                     skill_prompt=skill_prompt,
                     model=model,
+                    reasoning_effort=reasoning_effort,
                 )
             elif provider_type == ProviderType.COPILOT_CLI.value:
                 provider = CopilotCliProvider(
@@ -193,13 +196,23 @@ class ProviderManager:
         if persisted_engine == KiroEngine.KAS:
             raise KiroPhase0KASError(profile_has_v2_policy=False)
 
-        # Create provider on-demand
+        launch_metadata = metadata.get("metadata")
+        if not isinstance(launch_metadata, dict):
+            launch_metadata = {}
+
+        # Create provider on-demand with the same effective launch identity.
+        # This path is exercised after a cao-server restart; dropping tools,
+        # model, or effort here makes the restored in-memory provider disagree
+        # with the durable terminal record.
         provider = self.create_provider(
             metadata["provider"],
             terminal_id,
             metadata["tmux_session"],
             metadata["tmux_window"],
             metadata["agent_profile"],
+            metadata.get("allowed_tools"),
+            model=launch_metadata.get("launch_model"),
+            reasoning_effort=launch_metadata.get("launch_reasoning_effort"),
             engine=persisted_engine,
         )
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.

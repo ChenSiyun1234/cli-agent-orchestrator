@@ -56,11 +56,20 @@ DEFAULT_READY_TIMEOUT = 120.0
 _COMPLETION_POLL_INTERVAL = 1.0
 _IDLE_STABLE_POLLS = 3
 
+# A reused process can execute only one step at a time.  The lock covers
+# validation, send, wait, and extraction so two callers cannot both observe a
+# ready terminal and interleave prompts.  Entries are intentionally retained
+# for the server lifetime; terminal IDs are bounded, short-lived records.
+_REUSED_TERMINAL_LOCKS: dict[str, asyncio.Lock] = {}
+
 
 async def _validate_reused_terminal(
     terminal_id: str,
     requested_provider: str,
     requested_engine: Optional[KiroEngine | str],
+    requested_model: Optional[str],
+    requested_reasoning_effort: Optional[str],
+    requested_agent: Optional[str] = None,
 ) -> None:
     """Require reuse constraints to agree with authoritative terminal metadata."""
     metadata = await asyncio.to_thread(terminal_service.get_terminal_metadata, terminal_id)
@@ -74,27 +83,65 @@ async def _validate_reused_terminal(
             f"requested {requested_provider!r}, persisted {persisted_provider!r}"
         )
 
-    if requested_engine is None:
-        return
-    if persisted_provider != ProviderType.KIRO_CLI.value:
-        raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
-
-    explicit_engine = parse_kiro_engine(requested_engine)
-    assert explicit_engine is not None
-    if explicit_engine == KiroEngine.KAS:
-        # KAS remains unavailable regardless of which engine the terminal
-        # persisted; use the same structured Phase 0 guard as terminal creation.
-        raise KiroPhase0KASError(profile_has_v2_policy=False)
-
-    persisted_engine = parse_kiro_engine(metadata.get("engine"))
-    if persisted_engine is None:
-        # Legacy Kiro rows predate the engine column and are v2 by definition.
-        persisted_engine = KiroEngine.V2
-    if explicit_engine != persisted_engine:
+    persisted_agent = metadata.get("agent_profile")
+    if (
+        requested_agent is not None
+        and persisted_agent is not None
+        and persisted_agent != requested_agent
+    ):
         raise ValueError(
-            f"Kiro engine mismatch for reused terminal '{terminal_id}': "
-            f"requested {explicit_engine.value!r}, persisted {persisted_engine.value!r}"
+            f"Agent profile mismatch for reused terminal '{terminal_id}': "
+            f"requested {requested_agent!r}, persisted {persisted_agent!r}"
         )
+
+    launch_metadata = metadata.get("metadata")
+    if not isinstance(launch_metadata, dict):
+        launch_metadata = {}
+
+    persisted_engine = None
+    if persisted_provider == ProviderType.KIRO_CLI.value:
+        persisted_engine = parse_kiro_engine(metadata.get("engine"))
+        if persisted_engine is None:
+            # Legacy Kiro rows predate the engine column and are v2 by definition.
+            persisted_engine = KiroEngine.V2
+        if persisted_engine == KiroEngine.KAS:
+            # A persisted Phase 0 KAS row is never runnable, even when the caller
+            # does not repeat an explicit engine during terminal reuse.
+            raise KiroPhase0KASError(profile_has_v2_policy=False)
+
+    if requested_engine is not None:
+        if persisted_provider != ProviderType.KIRO_CLI.value:
+            raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
+
+        explicit_engine = parse_kiro_engine(requested_engine)
+        assert explicit_engine is not None
+        if explicit_engine == KiroEngine.KAS:
+            # KAS remains unavailable regardless of which engine the terminal
+            # persisted; use the same structured Phase 0 guard as terminal creation.
+            raise KiroPhase0KASError(profile_has_v2_policy=False)
+
+        assert persisted_engine is not None
+        if explicit_engine != persisted_engine:
+            raise ValueError(
+                f"Kiro engine mismatch for reused terminal '{terminal_id}': "
+                f"requested {explicit_engine.value!r}, persisted {persisted_engine.value!r}"
+            )
+
+    if requested_model is not None:
+        persisted_model = launch_metadata.get("launch_model")
+        if persisted_model != requested_model:
+            raise ValueError(
+                f"Model mismatch for reused terminal '{terminal_id}': "
+                f"requested {requested_model!r}, persisted {persisted_model!r}"
+            )
+
+    if requested_reasoning_effort is not None:
+        persisted_effort = launch_metadata.get("launch_reasoning_effort")
+        if persisted_effort != requested_reasoning_effort:
+            raise ValueError(
+                f"Reasoning effort mismatch for reused terminal '{terminal_id}': "
+                f"requested {requested_reasoning_effort!r}, persisted {persisted_effort!r}"
+            )
 
 
 class StepExecutionError(Exception):
@@ -142,7 +189,7 @@ class StepCancelledError(Exception):
 
 async def _wait_for_completion(
     terminal_id: str,
-    timeout: float,
+    timeout: Optional[float],
     cancel_event: Optional["asyncio.Event"] = None,
 ) -> None:
     """Wait for a post-input step to settle, polling ``status_monitor`` (issue #409).
@@ -170,10 +217,10 @@ async def _wait_for_completion(
 
     Raises:
         StepExecutionError(kind="error"): the terminal reached ``ERROR``.
-        StepExecutionError(kind="timeout"): no completion signal within ``timeout``.
+        StepExecutionError(kind="timeout"): an explicit ``timeout`` elapsed.
         StepCancelledError: ``cancel_event`` fired while waiting.
     """
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + timeout if timeout is not None else None
     observed_working = False
     consecutive_idle = 0
 
@@ -188,7 +235,10 @@ async def _wait_for_completion(
                 kind="error",
                 terminal_id=terminal_id,
             )
-        if current == TerminalStatus.COMPLETED:
+        # send_input arms the terminal before dispatch. Until PROCESSING has
+        # been observed, a cached COMPLETED marker belongs to the prior turn
+        # and must not finish this step immediately.
+        if current == TerminalStatus.COMPLETED and not status_monitor.is_input_armed(terminal_id):
             return
         if current == TerminalStatus.IDLE:
             # Post-input IDLE only counts once the agent has actually started
@@ -212,7 +262,7 @@ async def _wait_for_completion(
             # a stable idle — reset the idle streak but do not flip observed_working.
             consecutive_idle = 0
 
-        if time.monotonic() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             # Defensive: a terminal that flipped to ERROR right at the deadline is
             # a crash, not a slow run (preserve the kind="error" vs "timeout" split).
             if status_monitor.get_status(terminal_id) == TerminalStatus.ERROR:
@@ -240,6 +290,46 @@ async def _wait_for_completion(
             await asyncio.sleep(_COMPLETION_POLL_INTERVAL)
 
 
+async def _execute_terminal_step(
+    terminal_id: str,
+    prompt: str,
+    timeout: Optional[float],
+    cancel_event: Optional[asyncio.Event],
+    *,
+    created_here: bool,
+    teardown: bool,
+    registry: Optional[PluginRegistry],
+) -> AgentStepResult:
+    """Send, await, extract, and conditionally tear down one claimed terminal."""
+
+    await asyncio.to_thread(terminal_service.send_input, terminal_id, prompt)
+
+    try:
+        await _wait_for_completion(terminal_id, timeout, cancel_event)
+    except StepCancelledError:
+        if created_here:
+            await _best_effort_teardown(terminal_id, registry)
+        raise
+
+    try:
+        last_message = await asyncio.to_thread(
+            terminal_service.get_output, terminal_id, OutputMode.LAST
+        )
+    except BaseException:
+        if teardown and created_here:
+            await _best_effort_teardown(terminal_id, registry)
+        raise
+
+    result = AgentStepResult(
+        terminal_id=terminal_id,
+        last_message=last_message,
+        status=TerminalStatus.COMPLETED,
+    )
+    if teardown and created_here:
+        await _best_effort_teardown(terminal_id, registry)
+    return result
+
+
 async def run_agent_step(
     provider: str,
     agent: str,
@@ -247,7 +337,7 @@ async def run_agent_step(
     session_name: Optional[str] = None,
     reuse_terminal_id: Optional[str] = None,
     teardown: bool = True,
-    timeout: float = 600.0,
+    timeout: Optional[float] = None,
     ready_timeout: float = DEFAULT_READY_TIMEOUT,
     working_directory: Optional[str] = None,
     caller_id: Optional[str] = None,
@@ -258,6 +348,7 @@ async def run_agent_step(
     cancel_event: Optional[asyncio.Event] = None,
     engine: Optional[KiroEngine | str] = None,
     model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     use_worktree: bool = False,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
@@ -288,7 +379,9 @@ async def run_agent_step(
             caller owns the terminal's lifecycle).
         teardown: When True (default) and the terminal was created here, delete
             it after extraction. Ignored when ``reuse_terminal_id`` is set.
-        timeout: Max seconds to wait for the step to reach COMPLETED.
+        timeout: Optional maximum seconds to wait for completion. ``None``
+            (the default) keeps the task alive until completion, explicit
+            cancellation, or a real terminal error.
         ready_timeout: Max seconds to wait for a freshly created terminal to be
             ready to accept input.
         working_directory: Optional working directory for a freshly created
@@ -337,11 +430,15 @@ async def run_agent_step(
         engine: Explicit Kiro engine for this child step. This is never inferred
             from a parent terminal.
         model: Explicit per-call model override for a freshly created
-            terminal (ignored when reusing a terminal), forwarded to
-            ``terminal_service.create_terminal``. Lets a handoff caller pin
-            a specific model for this one worker without a dedicated agent
-            profile. Default None = behavior unchanged (profile.model, if
-            any, still applies).
+            terminal, forwarded to ``terminal_service.create_terminal``.
+            On reuse, an explicit value must match the terminal's recorded
+            launch model; CAO never silently retargets a running process.
+            Default None = behavior unchanged (profile.model, if any, still
+            applies).
+        reasoning_effort: Explicit provider-native effort for a freshly
+            created Codex or Claude Code terminal. ``None`` preserves the
+            profile/provider default. On reuse, an explicit value must match
+            the terminal's recorded launch effort.
         use_worktree: Issue #100 Phase 1. When True and a terminal is created
             here (``reuse_terminal_id`` is None), the freshly created terminal
             gets an isolated ``git worktree`` instead of sharing
@@ -417,6 +514,7 @@ async def run_agent_step(
             env_vars=env_vars,
             engine=engine,
             model=model,
+            reasoning_effort=reasoning_effort,
             use_worktree=use_worktree,
         )
         terminal_id = terminal.id
@@ -454,58 +552,47 @@ async def run_agent_step(
             )
     else:
         assert terminal_id is not None
-        await _validate_reused_terminal(terminal_id, provider, engine)
+        reuse_lock = _REUSED_TERMINAL_LOCKS.setdefault(terminal_id, asyncio.Lock())
+        if reuse_lock.locked():
+            raise ValueError(f"Reused terminal '{terminal_id}' is already claimed by another step")
+        async with reuse_lock:
+            await _validate_reused_terminal(
+                terminal_id,
+                provider,
+                engine,
+                model,
+                reasoning_effort,
+                requested_agent=agent,
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                raise StepCancelledError(terminal_id=terminal_id)
+            current = status_monitor.get_status(terminal_id)
+            if current not in _READY_STATES or status_monitor.is_input_armed(terminal_id):
+                raise ValueError(
+                    f"Reused terminal '{terminal_id}' is not ready "
+                    f"(status={current.value}, input_armed="
+                    f"{status_monitor.is_input_armed(terminal_id)})"
+                )
+            return await _execute_terminal_step(
+                terminal_id,
+                prompt,
+                timeout,
+                cancel_event,
+                created_here=False,
+                teardown=False,
+                registry=registry,
+            )
 
     assert terminal_id is not None  # for type-checkers: set in both branches
-
-    # Send the prompt. send_input is synchronous tmux I/O (bracketed paste +
-    # key sends); run it off the event loop so a slow tmux call cannot freeze
-    # the whole server for other requests (same hazard as issue #382, which was
-    # only fixed for DELETE /sessions). Any failure raises and propagates.
-    await asyncio.to_thread(terminal_service.send_input, terminal_id, prompt)
-
-    # Wait for completion — IN-PROCESS poll of status_monitor (NOT the
-    # HTTP-polling wait_until_terminal_status, which would reintroduce the
-    # self-loopback the single-seam rule forbids). Accepts a post-input IDLE as a
-    # completion signal alongside COMPLETED (issue #409a) and is interruptible via
-    # ``cancel_event`` (issue #409b). Raises StepExecutionError on timeout/ERROR,
-    # or StepCancelledError if cancellation fires mid-wait.
-    try:
-        await _wait_for_completion(terminal_id, timeout, cancel_event)
-    except StepCancelledError:
-        # A cancellation is NOT a run-failure. Tear down a terminal this call
-        # created (best-effort — never let cleanup mask the cancellation), then
-        # re-raise so the engine converges the run to CANCELLED without retrying.
-        if created_here:
-            await _best_effort_teardown(terminal_id, registry)
-        raise
-
-    # Extract the last agent message via the provider-specific path (mirrors
-    # how the handoff caller obtained output: get_output in LAST mode runs the
-    # provider's extract_last_message_from_script under the hood). This does a
-    # blocking tmux capture-pane plus regex extraction over the scrollback —
-    # potentially seconds for a large transcript — so run it off the loop.
-    # Clean up a terminal owned by this call if output extraction fails. Reused
-    # terminals remain owned by the caller.
-    try:
-        last_message = await asyncio.to_thread(
-            terminal_service.get_output, terminal_id, OutputMode.LAST
-        )
-    except BaseException:
-        if teardown and created_here:
-            await _best_effort_teardown(terminal_id, registry)
-        raise
-
-    result = AgentStepResult(
-        terminal_id=terminal_id,
-        last_message=last_message,
-        status=TerminalStatus.COMPLETED,
+    return await _execute_terminal_step(
+        terminal_id,
+        prompt,
+        timeout,
+        cancel_event,
+        created_here=True,
+        teardown=teardown,
+        registry=registry,
     )
-
-    if teardown and created_here:
-        await _best_effort_teardown(terminal_id, registry)
-
-    return result
 
 
 async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegistry]) -> None:

@@ -216,9 +216,9 @@ class TestWorkerIsStartedDirect:
             mock_be.return_value.get_history.side_effect = Exception("capture failed")
             assert ts._worker_is_started_direct("t1", MagicMock()) is False
 
-    def test_returns_false_when_get_status_raises(self):
+    def test_returns_false_when_screen_status_parse_raises(self):
         provider = MagicMock()
-        provider.get_status.side_effect = Exception("parse failure")
+        provider.get_status_from_screen.side_effect = Exception("parse failure")
         with (
             patch.object(
                 ts,
@@ -236,7 +236,7 @@ class TestWorkerIsStartedDirect:
         from cli_agent_orchestrator.models.terminal import TerminalStatus
 
         provider = MagicMock()
-        provider.get_status.return_value = TerminalStatus.PROCESSING
+        provider.get_status_from_screen.return_value = TerminalStatus.PROCESSING
         with (
             patch.object(
                 ts,
@@ -249,12 +249,15 @@ class TestWorkerIsStartedDirect:
             patch.object(ts, "get_backend") as mock_be,
         ):
             assert ts._worker_is_started_direct("t1", provider) is True
+            mock_be.return_value.get_history.assert_called_once_with(
+                "s1", "w1", tail_lines=200, strip_escapes=True
+            )
 
     def test_returns_false_when_status_is_idle(self):
         from cli_agent_orchestrator.models.terminal import TerminalStatus
 
         provider = MagicMock()
-        provider.get_status.return_value = TerminalStatus.IDLE
+        provider.get_status_from_screen.return_value = TerminalStatus.IDLE
         with (
             patch.object(
                 ts,

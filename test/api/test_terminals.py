@@ -563,6 +563,10 @@ class TestCreateInboxMessageEndpoint:
         mock_msg.id = 1
         mock_msg.sender_id = "sender1"
         mock_msg.receiver_id = "abcd1234"
+        mock_msg.orchestration_type = None
+        mock_msg.task_id = None
+        mock_msg.reply_to_message_id = None
+        mock_msg.review_verdict = None
         mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
 
         with (
@@ -585,6 +589,10 @@ class TestCreateInboxMessageEndpoint:
                 "sender1",
                 "abcd1234",
                 "hello",
+                task_id=None,
+                reply_to_message_id=None,
+                review_verdict=None,
+                orchestration_type=None,
             )
             mock_inbox.deliver_pending.assert_called_once_with("abcd1234", registry=ANY)
 
@@ -594,6 +602,10 @@ class TestCreateInboxMessageEndpoint:
         mock_msg.id = 2
         mock_msg.sender_id = "sender1"
         mock_msg.receiver_id = "abcd1234"
+        mock_msg.orchestration_type = None
+        mock_msg.task_id = None
+        mock_msg.reply_to_message_id = None
+        mock_msg.review_verdict = None
         mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
 
         with (

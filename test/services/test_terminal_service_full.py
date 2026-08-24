@@ -16,7 +16,9 @@ from cli_agent_orchestrator.services.terminal_service import (
     get_output,
     get_terminal,
     get_working_directory,
+    restore_persisted_terminal_monitors,
     send_input,
+    update_metadata,
 )
 
 
@@ -90,8 +92,8 @@ class TestCreateTerminal:
         mock_status_monitor,
         mock_schedule_deferred_init,
     ):
-        """The real terminal layer sends the model to provider construction and
-        the first task to the established deferred-init scheduler."""
+        """The real terminal layer sends launch policy and the first task to
+        the established deferred-init scheduler while persisting evidence."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -113,10 +115,24 @@ class TestCreateTerminal:
             initial_message="Review the current change",
             initial_message_orchestration_type=OrchestrationType.SEND_MESSAGE,
             model="gpt-5.1-codex",
+            reasoning_effort="xhigh",
+            metadata={
+                "display_name": "S0 reviewer",
+                "launch_model": "spoofed-model",
+                "launch_reasoning_effort": "low",
+            },
         )
 
         assert result.status == TerminalStatus.UNKNOWN
         assert mock_provider_manager.create_provider.call_args.kwargs["model"] == ("gpt-5.1-codex")
+        assert mock_provider_manager.create_provider.call_args.kwargs["reasoning_effort"] == (
+            "xhigh"
+        )
+        assert mock_db_create.call_args.kwargs["metadata"] == {
+            "display_name": "S0 reviewer",
+            "launch_model": "gpt-5.1-codex",
+            "launch_reasoning_effort": "xhigh",
+        }
         mock_provider.initialize.assert_not_awaited()
         mock_schedule_deferred_init.assert_called_once_with(
             mock_provider,
@@ -224,7 +240,9 @@ class TestCreateTerminal:
         mock_gen_window.return_value = "developer-abcd"
         mock_tmux.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(
-            name="developer", description="Developer", model="profile-default-model"
+            name="developer",
+            description="Developer",
+            model="profile-default-model",
         )
         mock_provider = AsyncMock()
         mock_provider.initialize.return_value = True
@@ -271,19 +289,26 @@ class TestCreateTerminal:
         mock_gen_window.return_value = "developer-abcd"
         mock_tmux.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(
-            name="developer", description="Developer", model="profile-default-model"
+            name="developer",
+            description="Developer",
+            model="profile-default-model",
+            codexConfig={"model_reasoning_effort": "high"},
         )
         mock_provider = AsyncMock()
         mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
-        await create_terminal("kiro_cli", "developer", new_session=True)
+        await create_terminal("codex", "developer", new_session=True)
 
         assert (
             mock_provider_manager.create_provider.call_args.kwargs["model"]
             == "profile-default-model"
         )
+        assert mock_db_create.call_args.kwargs["metadata"] == {
+            "launch_model": "profile-default-model",
+            "launch_reasoning_effort": "high",
+        }
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -1307,6 +1332,108 @@ class TestGetTerminal:
         assert result["status"] == TerminalStatus.UNKNOWN.value
 
 
+class TestRestorePersistedTerminalMonitors:
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.list_all_terminals")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_reconnects_existing_tmux_pane_without_sending_input(
+        self, backend, list_terminals, providers, fifos, monitor
+    ):
+        backend.supports_event_inbox.return_value = False
+        backend.session_exists.return_value = True
+        backend.get_history.side_effect = ["probe", "settled live history"]
+        list_terminals.return_value = [
+            {
+                "id": "abc12345",
+                "tmux_session": "cao-session",
+                "tmux_window": "worker-abcd",
+            }
+        ]
+
+        result = restore_persisted_terminal_monitors()
+
+        assert result == {"restored": 1, "skipped": 0, "failed": 0}
+        providers.get_provider.assert_called_once_with("abc12345")
+        backend.stop_pipe_pane.assert_called_once_with("cao-session", "worker-abcd")
+        fifos.create_reader.assert_called_once()
+        backend.pipe_pane.assert_called_once()
+        monitor.seed_terminal_history.assert_called_once_with("abc12345", "settled live history")
+        backend.send_keys.assert_not_called()
+        backend.send_special_key.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.list_all_terminals")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_missing_tmux_session_is_retained_and_skipped(self, backend, list_terminals):
+        backend.supports_event_inbox.return_value = False
+        backend.session_exists.return_value = False
+        list_terminals.return_value = [
+            {"id": "old12345", "tmux_session": "gone", "tmux_window": "worker"}
+        ]
+
+        assert restore_persisted_terminal_monitors() == {
+            "restored": 0,
+            "skipped": 1,
+            "failed": 0,
+        }
+
+    @patch("cli_agent_orchestrator.services.terminal_service.list_all_terminals")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_database_unavailable_is_best_effort(self, backend, list_terminals, caplog):
+        backend.supports_event_inbox.return_value = False
+        list_terminals.side_effect = RuntimeError("terminal table unavailable")
+
+        assert restore_persisted_terminal_monitors() == {
+            "restored": 0,
+            "skipped": 0,
+            "failed": 1,
+        }
+        assert "Could not list persisted terminals" in caplog.text
+
+
+class TestUpdateMetadata:
+    @patch("cli_agent_orchestrator.services.terminal_service.update_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_preserves_reserved_launch_identity(self, get_metadata, persist):
+        get_metadata.return_value = {
+            "metadata": {
+                "display_name": "old",
+                "launch_model": "gpt-5.6-sol",
+                "launch_reasoning_effort": "xhigh",
+            }
+        }
+        persist.return_value = True
+
+        assert update_metadata(
+            "abc12345",
+            {
+                "display_name": "new",
+                "launch_model": "spoof",
+                "launch_reasoning_effort": "low",
+            },
+        )
+        persist.assert_called_once_with(
+            "abc12345",
+            {
+                "display_name": "new",
+                "launch_model": "gpt-5.6-sol",
+                "launch_reasoning_effort": "xhigh",
+            },
+        )
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_clear_keeps_only_reserved_launch_identity(self, get_metadata, persist):
+        get_metadata.return_value = {
+            "metadata": {"display_name": "old", "launch_model": "claude-fable-5"}
+        }
+        persist.return_value = True
+
+        assert update_metadata("abc12345", None)
+        persist.assert_called_once_with("abc12345", {"launch_model": "claude-fable-5"})
+
+
 class TestGetWorkingDirectory:
     """Tests for get_working_directory function."""
 
@@ -1362,6 +1489,29 @@ class TestSendInput:
             submit_delay=0.3,
         )
         mock_update.assert_called_once_with("test1234")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_failure_prepares_baseline_but_does_not_commit_dispatch(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_update
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.3
+        mock_tmux.send_keys.side_effect = RuntimeError("transport failed")
+
+        with pytest.raises(RuntimeError, match="transport failed"):
+            send_input("test1234", "test message")
+
+        provider.prepare_input_delivery.assert_called_once()
+        provider.mark_input_received.assert_not_called()
+        mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
@@ -2098,6 +2248,40 @@ class TestDeferredInitFailureNotification:
 
         mock_create_inbox.assert_not_called()
         mock_delete.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit",
+        new_callable=AsyncMock,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    async def test_unconfirmed_delivery_never_deletes_live_worker(
+        self, mock_meta, mock_send, mock_confirm, mock_notify
+    ):
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+        )
+
+        mock_meta.return_value = {"caller_id": "super123"}
+        mock_confirm.return_value = False
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True
+        provider_instance.shell_baseline = None
+
+        before_tasks = set(_deferred_init_tasks)
+        _schedule_deferred_init(
+            provider_instance, "worker99", "do the task", OrchestrationType.ASSIGN, None
+        )
+        (task,) = set(_deferred_init_tasks) - before_tasks
+        await task
+
+        mock_send.assert_called_once()
+        mock_notify.assert_called_once()
+        assert mock_notify.call_args.args[3] is False
+        assert "left running" in mock_notify.call_args.args[1]
 
 
 class TestDeferredInitWaitingUserAnswerSurvival:

@@ -775,6 +775,11 @@ WORKFLOW_ENV_VALUE_MAX_LEN = 256
 MODEL_ID_RE = r"^[A-Za-z0-9._:/-]+$"
 MODEL_ID_MAX_LEN = 128
 
+# Native reasoning-effort levels shared by Codex and Claude Code. The UniDLQ
+# task vocabulary calls the exceptional top tier "Ultra"; dispatchers map it
+# to the providers' concrete ``max`` value before crossing this boundary.
+REASONING_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
 # Live-event follower (issue #505, U10). The CLI ``cao workflow events --follow``
 # and the MCP ``workflow_events`` open #504's events-follow SSE route
 # (``GET /workflows/runs/{id}/events`` with ``Accept: text/event-stream``) as thin

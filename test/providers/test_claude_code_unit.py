@@ -1657,11 +1657,8 @@ class TestClaudeCodeProviderModelFlag:
         assert "--model fable-5" in command
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_model_override_ignored_for_native_agent_profile(self, mock_load):
-        """A profile that maps to a native Claude Code agent handles its own
-        model config -- an explicit override is not applied there (by
-        design, see the provider's own comment), and does not appear in the
-        launch command at all."""
+    def test_model_override_applies_for_native_agent_profile(self, mock_load):
+        """A native agent still receives CAO's recorded model selection."""
         mock_profile = MagicMock()
         mock_profile.native_agent = "my-claude-agent"
         mock_profile.permissionMode = None
@@ -1671,7 +1668,7 @@ class TestClaudeCodeProviderModelFlag:
         command = provider._build_claude_command()
 
         assert "--agent my-claude-agent" in command
-        assert "--model" not in command
+        assert "--model fable-5" in command
 
     def test_no_agent_profile_still_honors_explicit_model(self):
         """No CAO profile exists (agent_profile passed straight through to
@@ -1687,6 +1684,36 @@ class TestClaudeCodeProviderModelFlag:
 
         assert "--agent agent" in command
         assert "--model fable-5" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_explicit_reasoning_effort_uses_native_flag(self, mock_load):
+        """A task-scoped effort is forwarded through Claude Code's own CLI."""
+        mock_profile = MagicMock()
+        mock_profile.model = "claude-opus-5"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", reasoning_effort="xhigh")
+        command = provider._build_claude_command()
+
+        assert "--model claude-opus-5" in command
+        assert "--effort xhigh" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_omitted_reasoning_effort_adds_no_native_flag(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
+        command = provider._build_claude_command()
+
+        assert "--effort" not in command
 
 
 class TestClaudeCodeProviderPermissionMode:
