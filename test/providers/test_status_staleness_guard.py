@@ -108,6 +108,28 @@ class TestContentBasedStalenessGuard:
         assert provider._snapshot_last_response == "Previous response"
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_only_new_exact_interrupt_banner_confirms_current_turn(self, mock_backend):
+        """A retained old banner is stale; one emitted after C-c is completion evidence."""
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        box = "─" * 20
+        interrupted = "Interrupted · What should Claude do instead?"
+        baseline = f"● Partial answer\n{interrupted}\n{box}\n❯ \n{box}"
+        mock_backend.get_history.return_value = baseline
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+
+        provider.prepare_input_delivery()
+        provider.mark_input_received()
+
+        assert provider.confirms_current_turn_completion(baseline) is False
+        # Quoted text and near-matches do not count as Claude's exact banner.
+        quoted = f'● The UI said "{interrupted}"\n{box}\n❯ \n{box}'
+        assert provider._count_interruption_banners(quoted) == 0
+
+        newly_interrupted = baseline + f"\n{interrupted}\n{box}\n❯ \n{box}"
+        assert provider.confirms_current_turn_completion(newly_interrupted) is True
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_shorter_buffer_after_input_still_processing(self, mock_backend):
         """Buffer SHRINKS after input (Ink composer-collapse) → still PROCESSING
         while tail content unchanged. This is the key regression the length-based

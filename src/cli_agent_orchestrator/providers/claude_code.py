@@ -110,6 +110,14 @@ EXTRACTION_RESPONSE_PATTERN = re.compile(
 # making a genuinely completed turn look identical to its pre-send baseline.
 # Require response text to begin on the same physical line instead.
 SNAPSHOT_RESPONSE_PATTERN = re.compile(r"^[ \t]*[⏺●][ \t]+(?=\S)", re.MULTILINE)
+# Exact completion banner emitted by Claude after a user interrupts a turn.
+# Keep this anchored to the whole physical line so quoted prose cannot become
+# completion evidence.  Its occurrence count is captured with the input
+# baseline below: a retained banner from an older interrupt is stale, while a
+# newly emitted banner proves the current interrupt settled.
+INTERRUPTION_BANNER_PATTERN = re.compile(
+    r"^[ \t]*Interrupted · What should Claude do instead\?[ \t]*$", re.MULTILINE
+)
 # Own-line effort-footer, e.g. "● high · /effort" (glyph + the tail shape
 # above). Standalone (not a lookahead) so get_status()'s box-walk can skip past
 # this exact chrome line while searching for a live spinner (GH #459). Shares
@@ -353,6 +361,7 @@ class ClaudeCodeProvider(BaseProvider):
         self._snapshot_tail_hash: Optional[str] = None
         self._snapshot_last_response: Optional[str] = None
         self._snapshot_response_count: int = 0
+        self._snapshot_interruption_banner_count: int = 0
         self._snapshot_had_quota_banner = False
         self._input_snapshot_prepared = False
         self._quota_latched = False
@@ -412,6 +421,13 @@ class ClaudeCodeProvider(BaseProvider):
             response_lines.append(stripped)
         text = "\n".join(response_lines).strip()
         return text if text else None
+
+    @staticmethod
+    def _count_interruption_banners(output: str) -> int:
+        """Count exact Claude interrupt-completion banners in *output*."""
+
+        clean = strip_terminal_escapes(output)
+        return len(list(INTERRUPTION_BANNER_PATTERN.finditer(clean)))
 
     def _load_profile(self) -> Optional["AgentProfile"]:
         """Load this terminal's CAO agent profile from disk, if any.
@@ -964,6 +980,18 @@ class ClaudeCodeProvider(BaseProvider):
         if self._latch_active_quota_banner(output):
             return TerminalStatus.ERROR
 
+        # Ctrl+C repaints in place: the raw FIFO still contains the erased
+        # spinner/footer and the partial response, so the ordinary processing
+        # checks below cannot distinguish that stale chrome from live work.
+        # Only an exact banner occurrence newer than the pre-C-c baseline is
+        # authoritative evidence that the interrupted turn has settled.
+        new_interruption_banner = (
+            self._input_generation > 0
+            and self._count_interruption_banners(output) > self._snapshot_interruption_banner_count
+        )
+        if new_interruption_banner:
+            return TerminalStatus.COMPLETED
+
         # PRIMARY PROCESSING check: walk backwards from the *last* separator.
         _sep_re = re.compile(r"(?:\x1b\[[0-9;]*m)*\u2500{20,}")
         _sep_positions = [m.start() for m in _sep_re.finditer(output)]
@@ -1464,6 +1492,7 @@ class ClaudeCodeProvider(BaseProvider):
         self._snapshot_had_quota_banner = _has_account_quota_banner(strip_terminal_escapes(output))
         clean = self._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
         self._snapshot_response_count = len(list(SNAPSHOT_RESPONSE_PATTERN.finditer(clean)))
+        self._snapshot_interruption_banner_count = self._count_interruption_banners(output)
 
     def prepare_input_delivery(self) -> None:
         """Snapshot the previous turn before bracketed paste can finish quickly."""

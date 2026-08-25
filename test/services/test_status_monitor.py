@@ -443,6 +443,75 @@ class TestScreenDetection:
             assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.COMPLETED
             assert sm._last_status["t1"] == TerminalStatus.COMPLETED
 
+    def test_ctrl_c_rebaseline_holds_partial_frame_until_new_interrupt_banner(self):
+        """Spinner erasure after C-c cannot complete on a retained partial response."""
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        provider = ClaudeCodeProvider("t1", "s", "w")
+        provider._initialized = True
+        box = "─" * 20
+        live = (
+            "\x1b[H\x1b[2J"
+            "● PARTIAL_RESPONSE\r\n"
+            "✢ Thinking… (1s · ↓ 12 tokens)\r\n" + f"{box}\r\n❯ \r\n{box}\r\n"
+            "  esc to interrupt"
+        )
+        backend.get_history.return_value = live
+
+        with (
+            patch(
+                "cli_agent_orchestrator.backends.registry.get_backend",
+                return_value=backend,
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.claude_code.get_backend",
+                return_value=backend,
+            ),
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm,
+        ):
+            mock_pm.get_provider.return_value = provider
+            sm = StatusMonitor()
+            sm._buffers["t1"] = live
+            sm._feed_screen_locked("t1", live)
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+
+            # This is the baseline lifecycle send_special_key uses around the
+            # successful C-c transport.
+            provider.prepare_input_delivery()
+            sm.notify_input_sent("t1")
+            provider.mark_input_received()
+
+            # Ctrl+C erases the spinner/footer before drawing its banner. The
+            # partial response and ready box remain, so screen-only detection
+            # says COMPLETED, but the raw baseline rejects that stale frame.
+            erased = "\x1b[2;1H\x1b[2K\x1b[6;1H\x1b[2K"
+            sm._buffers["t1"] += erased
+            sm._feed_screen_locked("t1", erased)
+            sm._bursting["t1"] = False
+            assert (
+                provider.get_status_from_screen(list(sm._screens["t1"][0].display))
+                == TerminalStatus.COMPLETED
+            )
+            assert provider.confirms_current_turn_completion(sm._buffers["t1"]) is False
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+
+            # If output resumes, the live spinner remains authoritative and
+            # cannot transiently settle the interrupted turn.
+            resumed = "\x1b[2;1H✶ Resuming… (2s · ↓ 15 tokens)"
+            sm._buffers["t1"] += resumed
+            sm._feed_screen_locked("t1", resumed)
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+
+            # Claude's newly emitted exact banner is post-baseline completion
+            # evidence even though the same partial response stays on screen.
+            banner = "\x1b[2;1H\x1b[2K" "Interrupted · What should Claude do instead?"
+            sm._buffers["t1"] += banner
+            sm._feed_screen_locked("t1", banner)
+            sm._bursting["t1"] = False
+            assert provider.confirms_current_turn_completion(sm._buffers["t1"]) is True
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.COMPLETED
+            assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
     def test_stale_async_detection_cannot_consume_new_generation(self):
         sm = StatusMonitor()
         sm._last_status["t1"] = TerminalStatus.COMPLETED

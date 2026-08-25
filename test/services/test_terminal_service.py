@@ -1,6 +1,6 @@
 """Unit tests for terminal service get_working_directory and send_special_key functions."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -145,18 +145,24 @@ class TestSendSpecialKey:
         mock_update_last_active.assert_called_once_with(terminal_id)
 
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_special_key_ctrl_c(
-        self, mock_get_metadata, mock_tmux_client, mock_update_last_active
+        self, mock_get_metadata, mock_tmux_client, mock_provider_manager, mock_update_last_active
     ):
-        """Test that send_special_key can send C-c (Ctrl+C) to a terminal."""
+        """C-c snapshots immediately before transport and commits after it."""
         # Arrange
         terminal_id = "test-terminal-002"
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "reviewer-efgh",
         }
+        provider = mock_provider_manager.get_provider.return_value
+        calls = MagicMock()
+        calls.attach_mock(provider.prepare_input_delivery, "prepare")
+        calls.attach_mock(mock_tmux_client.send_special_key, "transport")
+        calls.attach_mock(provider.mark_input_received, "mark")
 
         # Act
         result = send_special_key(terminal_id, "C-c")
@@ -166,6 +172,31 @@ class TestSendSpecialKey:
         mock_tmux_client.send_special_key.assert_called_once_with(
             "cao-session", "reviewer-efgh", "C-c"
         )
+        assert calls.mock_calls == [
+            call.prepare(),
+            call.transport("cao-session", "reviewer-efgh", "C-c"),
+            call.mark(),
+        ]
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_special_key_ctrl_c_transport_failure_does_not_commit_baseline(
+        self, mock_get_metadata, mock_tmux_client, mock_provider_manager
+    ):
+        """A failed C-c transport may prepare, but must not mark delivery."""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "reviewer-efgh",
+        }
+        mock_tmux_client.send_special_key.side_effect = RuntimeError("transport failed")
+        provider = mock_provider_manager.get_provider.return_value
+
+        with pytest.raises(RuntimeError, match="transport failed"):
+            send_special_key("test-terminal-002", "C-c")
+
+        provider.prepare_input_delivery.assert_called_once_with()
+        provider.mark_input_received.assert_not_called()
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
@@ -197,10 +228,11 @@ class TestSendSpecialKey:
             send_special_key(terminal_id, "Escape")
 
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_special_key_escape(
-        self, mock_get_metadata, mock_tmux_client, mock_update_last_active
+        self, mock_get_metadata, mock_tmux_client, mock_provider_manager, mock_update_last_active
     ):
         """Test that send_special_key can send Escape key."""
         # Arrange
@@ -218,6 +250,26 @@ class TestSendSpecialKey:
         mock_tmux_client.send_special_key.assert_called_once_with(
             "cao-session", "developer-mnop", "Escape"
         )
+        mock_provider_manager.get_provider.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_special_key_ctrl_u_does_not_rebaseline(
+        self, mock_get_metadata, mock_tmux_client, mock_provider_manager
+    ):
+        """Composer clearing is not a turn boundary."""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-mnop",
+        }
+
+        assert send_special_key("test-terminal-004", "C-u") is True
+
+        mock_tmux_client.send_special_key.assert_called_once_with(
+            "cao-session", "developer-mnop", "C-u"
+        )
+        mock_provider_manager.get_provider.assert_not_called()
 
 
 class TestExitTerminalCli:

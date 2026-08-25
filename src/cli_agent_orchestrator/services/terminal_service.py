@@ -1458,7 +1458,19 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         # processing cycle that must be allowed to push past any latched
         # ready status.
         status_monitor.notify_input_sent(terminal_id)
-        get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+
+        # Ctrl+C ends the current Claude turn and starts a new ready-state
+        # transition. Capture the provider's pre-interrupt baseline immediately
+        # before transport, then commit it only after the key was delivered.
+        # Other special keys do not define a new Claude turn and must not reset
+        # its completion baseline.
+        provider = provider_manager.get_provider(terminal_id) if key == "C-c" else None
+        backend = get_backend()
+        if provider:
+            provider.prepare_input_delivery()
+        backend.send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+        if provider:
+            provider.mark_input_received()
 
         update_last_active(terminal_id)
         logger.info(f"Sent special key '{key}' to terminal: {terminal_id}")
