@@ -285,6 +285,78 @@ class TestScreenDetection:
 
         assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
 
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_streamed_fragmented_spinner_frame_stays_processing_end_to_end(
+        self, mock_get_backend, mock_pm
+    ):
+        """Faithful end-to-end regression (run 2da903dd, no-tool run_step).
+
+        Drives real pyte compositing: a long streamed answer has emitted only
+        ROW_0001..ROW_0041 and a cursor redraw fragments the live spinner into
+        "✗ Pontif cating…" (a real ESC[2K erase + torn repaint). The frame carries
+        a ● response marker + the boxed composer with a live "esc to interrupt"
+        footer STRICTLY AFTER the box bottom rail — the fragmentation-proof proof
+        that the turn is still streaming. StatusMonitor keeps the terminal
+        PROCESSING through both the quiescence apply and the poll-time refresh, so
+        run_step cannot inject /exit mid-stream. When the turn settles (footer
+        replaced by the idle footer), it flips COMPLETED.
+        """
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_get_backend.return_value = backend
+        provider = ClaudeCodeProvider("t1", "s", "w")
+        provider._initialized = True
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        box = "─" * 20
+        rows = "".join(f"ROW_{i:04d}\r\n" for i in range(1, 42))
+        frame1 = (
+            "\x1b[H\x1b[2J"
+            "● LONG_STREAM_BEGIN\r\n"
+            + rows
+            + "✽ Pontificating… (41s · ↓ 3.1k tokens)\r\n"
+            + f"{box}\r\n❯ \r\n{box}\r\n  esc to interrupt"
+        )
+        sm._buffers["t1"] = frame1
+        sm._feed_screen_locked("t1", frame1)
+        sm._detect_and_apply_screen("t1", provider)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+        # Cursor redraw fragments the spinner: move to its row, erase it, and
+        # repaint only a torn prefix ("Pontif cating…"). The live footer below the
+        # box is untouched, so the turn is still proven active.
+        spinner_row = 1 + 41 + 1  # BEGIN(row1) + 41 rows + spinner row (1-indexed)
+        torn = f"\x1b[{spinner_row};1H\x1b[2K✗ Pontif cating…"
+        sm._buffers["t1"] = frame1 + torn
+        sm._feed_screen_locked("t1", torn)
+        composited = list(sm._screens["t1"][0].display)
+        # Sanity: the fragmented spinner defeats spinner detection, but the live
+        # "esc to interrupt" footer after the box still reads PROCESSING.
+        assert provider.get_status_from_screen(composited) == TerminalStatus.PROCESSING
+
+        # Quiescence apply keeps PROCESSING.
+        sm._detect_and_apply_screen("t1", provider)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        # Poll-time refresh also keeps PROCESSING (no premature completion).
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+
+        # Final frame: the turn has settled — the live footer is gone (replaced by
+        # the idle bypass-permissions footer) and a completion summary follows the
+        # full response, so it flips COMPLETED.
+        final = (
+            "\x1b[H\x1b[2J"
+            "● LONG_STREAM_BEGIN\r\nROW_2499\r\nROW_2500\r\nLONG_STREAM_END\r\n"
+            "✻ Pontificated for 154s\r\n"
+            + f"{box}\r\n❯ \r\n{box}\r\n  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+        )
+        sm._buffers["t1"] = final
+        sm._feed_screen_locked("t1", final)
+        sm._detect_and_apply_screen("t1", provider)
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
     def test_stale_async_detection_cannot_consume_new_generation(self):
         sm = StatusMonitor()
         sm._last_status["t1"] = TerminalStatus.COMPLETED

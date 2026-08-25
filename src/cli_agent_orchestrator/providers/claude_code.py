@@ -273,6 +273,17 @@ NEW_TUI_SPINNER_PATTERN = r"[✶✢✽✻✳·*][^\n]*ing…"
 # ("* Remember to deploy…") or the version footer ("· latest: … update…")
 # sitting directly above the box from being misread as a live spinner.
 NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*ing\b.*…")
+# The newest TUI renders a live "esc to interrupt" hint in the footer BELOW the
+# input box while — and only while — the current turn is still producing output
+# (the exact 2da903dd streamed-response frame carried it). It disappears the
+# instant the turn settles. This is the smallest structural, glyph-independent
+# proof that a response is still active: unlike the spinner it survives a cursor
+# redraw that fragments the spinner text ("✽ Pontif cating…"), and unlike the
+# completion summary it is present for dot/asterisk glyph frames and absent for
+# summaryless settled frames. It only counts STRICTLY AFTER the input box's
+# bottom rail — a quoted "esc to interrupt" in response text, or a stale footer
+# from a prior frame, sits above the box and must not be read as live.
+LIVE_INTERRUPT_FOOTER = "esc to interrupt"
 
 
 def _has_account_quota_banner(output: str) -> bool:
@@ -1100,6 +1111,16 @@ class ClaudeCodeProvider(BaseProvider):
                     return TerminalStatus.PROCESSING
                 break
 
+        # Fragmentation-proof live signal: a footer containing "esc to interrupt"
+        # STRICTLY AFTER the input box's bottom rail (input_box.end()) proves the
+        # current turn is still streaming — independent of spinner-glyph
+        # fragmentation ("✽ Pontif cating…") and of the completion-summary glyph
+        # (dot/asterisk summaries the summary patterns exclude). A quoted or
+        # stale "esc to interrupt" ABOVE the box sits before input_box.end() and
+        # is correctly ignored, so it cannot masquerade as live.
+        if input_box is not None and LIVE_INTERRUPT_FOOTER in output[input_box.end() :].lower():
+            return TerminalStatus.PROCESSING
+
         # COMPLETED: the finished turn left output behind — a "✻ <Verb>ed for Ns"
         # completion summary OR a start-of-line response marker (legacy ⏺ or the
         # newest TUI's ●) — and the input prompt is visible. This is reached only
@@ -1143,6 +1164,15 @@ class ClaudeCodeProvider(BaseProvider):
         ):
             return TerminalStatus.PROCESSING
 
+        # COMPLETED fallback: with no live "esc to interrupt" footer after the box
+        # (checked above), the turn has settled. A completion summary
+        # ("✻ <Verb>ed for Ns"), a start-of-line response marker (legacy ⏺ or the
+        # newest TUI's ●), or the legacy ⏺ marker plus a visible input prompt is a
+        # valid completion — including a summaryless response-only final and a
+        # dot/asterisk-glyph summary the summary pattern cannot match. The live
+        # footer above is what keeps an ACTIVE stream (partial ● + fragmented
+        # spinner, or a stale prior summary above a newer ● stream) at PROCESSING,
+        # so this fallback no longer risks completing an in-flight turn.
         if last_idle is not None and (
             last_completion is not None
             or last_sol_response is not None
@@ -1256,6 +1286,28 @@ class ClaudeCodeProvider(BaseProvider):
             for pi in prompt_idx
         )
         if boxed_prompt:
+            # Fragmentation-proof live signal (mirrors get_status): a footer
+            # containing "esc to interrupt" STRICTLY AFTER the input box's bottom
+            # rail proves the current turn is still streaming — surviving a
+            # cursor redraw that fragments the spinner ("✽ Pontif cating…") and a
+            # dot/asterisk completion glyph. A quoted/stale "esc to interrupt"
+            # ABOVE the box (in response text or a prior frame) is before the box
+            # bottom rail and is ignored.
+            bottom_rail = None
+            for pi in prompt_idx:
+                if any(0 < pi - si <= 2 for si in sep_idx) and any(
+                    0 < si - pi <= 2 for si in sep_idx
+                ):
+                    bottom_rail = min(si for si in sep_idx if 0 < si - pi <= 2)
+            if bottom_rail is not None and any(
+                LIVE_INTERRUPT_FOOTER in rows[j].lower() for j in range(bottom_rail + 1, len(rows))
+            ):
+                return TerminalStatus.PROCESSING
+            # Settled fallback: a completion summary or a start-of-line response
+            # marker (legacy ⏺ or the newest TUI's ●) is a valid completion —
+            # including a summaryless response-only final and a dot/asterisk
+            # summary the summary pattern cannot match. Without the live footer
+            # this can no longer complete an in-flight stream.
             if re.search(
                 GET_STATUS_COMPLETION_PATTERN, joined
             ) or EXTRACTION_RESPONSE_PATTERN.search(joined):

@@ -2605,6 +2605,138 @@ class TestClaudeCodeScreenDetection:
     def test_empty_screen_is_unknown(self):
         assert self._p().get_status_from_screen(["", "", ""]) == TerminalStatus.UNKNOWN
 
+    # A post-box "esc to interrupt" footer is the live-turn signal (see
+    # LIVE_INTERRUPT_FOOTER): present while streaming, gone once settled.
+    FOOT = "  esc to interrupt"
+    IDLE_FOOT = "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+
+    def test_active_stream_with_live_footer_stays_processing(self):
+        """Root-cause regression, RETAINED (run 2da903dd, no-tool run_step).
+
+        A long streamed answer had emitted only ROW_0001..ROW_0041 of
+        ROW_0001..ROW_2500 when a cursor redraw FRAGMENTED the live spinner into
+        "✗ Pontif cating…" (a torn "Pontificating…"). Every spinner detector
+        needs a contiguous gerund, so spinner detection misses it; the frame
+        carries a ● response marker + the boxed composer. The still-active turn
+        is proved by the "esc to interrupt" footer STRICTLY AFTER the box bottom
+        rail, so both paths stay PROCESSING regardless of spinner fragmentation.
+        """
+        provider = self._p()
+        box = "─" * 20
+        rows = "\n".join(f"ROW_{i:04d}" for i in range(1, 42))
+        partial = (
+            f"● LONG_STREAM_BEGIN\n{rows}\n✗ Pontif cating…\n" f"{box}\n❯ \n{box}\n{self.FOOT}"
+        )
+        assert provider.get_status(partial) == TerminalStatus.PROCESSING
+        assert provider.get_status_from_screen(partial.split("\n")) == TerminalStatus.PROCESSING
+
+    def test_stale_summary_above_active_stream_stays_processing(self):
+        """A STALE prior-turn summary ("✻ Pondered for 12s") ABOVE a newer,
+        still-active ● stream must NOT complete it. The live "esc to interrupt"
+        footer after the box keeps both paths PROCESSING."""
+        provider = self._p()
+        box = "─" * 20
+        rows = "\n".join(f"ROW_{i:04d}" for i in range(1, 42))
+        stale = (
+            "✻ Pondered for 12s\n"
+            f"● LONG_STREAM_BEGIN\n{rows}\n✗ Pontif cating…\n"
+            f"{box}\n❯ \n{box}\n{self.FOOT}"
+        )
+        assert provider.get_status(stale) == TerminalStatus.PROCESSING
+        assert provider.get_status_from_screen(stale.split("\n")) == TerminalStatus.PROCESSING
+
+    def test_erased_spinner_with_live_footer_stays_processing(self):
+        """Earlier variant (run 3344ab3a): a redraw erased the spinner line
+        entirely, leaving only a ● response + boxed composer. The post-box live
+        footer still proves the turn is active ⇒ PROCESSING."""
+        provider = self._p()
+        box = "─" * 20
+        erased_screen = [
+            "● Working through the task, progress so far.",
+            "",
+            box,
+            "❯ ",
+            box,
+            self.FOOT,
+        ]
+        assert provider.get_status_from_screen(erased_screen) == TerminalStatus.PROCESSING
+
+    def test_summaryless_settled_response_completes(self):
+        """Summaryless-completion compatibility (independent review): a settled
+        response-only frame (● + boxed prompt, NO completion summary and NO live
+        footer) is a valid completion and must NOT be pinned PROCESSING."""
+        provider = self._p()
+        box = "─" * 20
+        settled = f"● All done — results are above.\n{box}\n❯ \n{box}\n{self.IDLE_FOOT}"
+        assert provider.get_status(settled) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(settled.split("\n")) == TerminalStatus.COMPLETED
+
+    def test_dot_glyph_summary_settled_completes(self):
+        """A settled turn whose completion summary uses the dot/asterisk glyph
+        ("* Cooked for 3s") — which the summary patterns deliberately exclude —
+        still completes via its ● response marker once no live footer remains."""
+        provider = self._p()
+        box = "─" * 20
+        dotted = (
+            f"● Fib written and tests pass.\n* Cooked for 3s\n{box}\n❯ \n{box}\n{self.IDLE_FOOT}"
+        )
+        assert provider.get_status(dotted) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(dotted.split("\n")) == TerminalStatus.COMPLETED
+
+    def test_quoted_interrupt_footer_above_box_is_not_live(self):
+        """A quoted "esc to interrupt" in the RESPONSE text (above the box) is not
+        the live footer — it sits before the box bottom rail and must be ignored,
+        so a settled turn quoting it still completes."""
+        provider = self._p()
+        box = "─" * 20
+        quoted = (
+            '● To stop a turn, press "esc to interrupt" — done.\n'
+            f"✻ Explained for 2s\n{box}\n❯ \n{box}\n{self.IDLE_FOOT}"
+        )
+        assert provider.get_status(quoted) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(quoted.split("\n")) == TerminalStatus.COMPLETED
+
+    def test_stale_footer_above_box_is_not_live(self):
+        """A stale "esc to interrupt" footer left ABOVE the current box (from a
+        prior frame) is not live — only a footer AFTER the box bottom rail counts,
+        so the settled current turn completes."""
+        provider = self._p()
+        box = "─" * 20
+        stale_footer = (
+            f"● Prior turn output.\n{self.FOOT}\n✻ Noted for 1s\n"
+            f"{box}\n❯ \n{box}\n{self.IDLE_FOOT}"
+        )
+        assert provider.get_status(stale_footer) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(stale_footer.split("\n")) == TerminalStatus.COMPLETED
+
+    def test_final_summary_frame_completes(self):
+        """The final frame (LONG_STREAM_END + summary, no live footer) completes."""
+        provider = self._p()
+        box = "─" * 20
+        final = (
+            "● LONG_STREAM_BEGIN\nROW_2499\nROW_2500\nLONG_STREAM_END\n"
+            f"✻ Pontificated for 154s\n{box}\n❯ \n{box}\n{self.IDLE_FOOT}"
+        )
+        assert provider.get_status(final) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(final.split("\n")) == TerminalStatus.COMPLETED
+
+    def test_short_complete_response_still_completes(self):
+        """A short complete response (456c487d-style) completes immediately."""
+        provider = self._p()
+        box = "─" * 20
+        short = f"● Fib written and all tests pass.\n✻ Crunched for 3s\n{box}\n❯ \n{box}"
+        assert provider.get_status(short) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(short.split("\n")) == TerminalStatus.COMPLETED
+
+    def test_legacy_marker_completes_without_summary(self):
+        """Legacy ⏺ fast completions are preserved: the older response glyph is
+        itself the completion signal and needs no summary."""
+        provider = self._p()
+        box = "─" * 20
+        legacy = f"⏺ Short answer, done.\n{box}\n❯ \n{box}"
+        assert provider.get_status(legacy) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(legacy.split("\n")) == TerminalStatus.COMPLETED
+
 
 class TestClaudeCodeBackgroundTaskNotCompleted:
     """A backgrounded task must not read as COMPLETED (GH #392).
