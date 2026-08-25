@@ -294,15 +294,29 @@ class StatusMonitor:
             try:
                 lines: List[str] = list(scr[0].display) if scr is not None else []
             except Exception:
-                # pyte can transiently hold zero-length cell data while rendering
-                # complex TUI redraws. Fall back to raw-buffer detection instead of
-                # letting the quiescence callback tear down status monitoring.
+                # pyte can retain a torn wide-character cell after a complex TUI
+                # redraw. Rebuild from the bounded rolling buffer so one corrupt
+                # screen cannot force all later samples onto the stale raw path.
                 logger.exception(
-                    "Error rendering screen status for %s; falling back to raw buffer",
+                    "Error rendering screen status for %s; rebuilding from rolling buffer",
                     terminal_id,
                 )
-                fallback_buffer = buffer
-                lines = []
+                try:
+                    import pyte
+
+                    screen = pyte.Screen(PYTE_SCREEN_COLS, PYTE_SCREEN_ROWS)
+                    stream = pyte.Stream(screen)
+                    stream.feed(buffer)
+                    lines = list(screen.display)
+                except Exception:
+                    logger.exception(
+                        "Error rebuilding screen status for %s; falling back to raw buffer",
+                        terminal_id,
+                    )
+                    fallback_buffer = buffer
+                    lines = []
+                else:
+                    self._screens[terminal_id] = (screen, stream)
         return lines, fallback_buffer
 
     def _detect_screen(

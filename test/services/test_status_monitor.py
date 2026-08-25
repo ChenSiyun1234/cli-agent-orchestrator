@@ -369,8 +369,31 @@ class TestScreenDetection:
         assert sm.get_status("t1") == TerminalStatus.COMPLETED
         assert sm.is_input_armed("t1") is True
 
+    def test_render_error_rebuilds_screen_from_rolling_buffer(self):
+        provider = ClaudeCodeProvider("t1", "session", "window")
+        sm = StatusMonitor()
+        box = "─" * 20
+        final = (
+            "\x1b[H\x1b[2J"
+            "● LONG_STREAM_BEGIN\r\nROW_2500\r\nLONG_STREAM_END\r\n"
+            "✻ Pontificated for 154s\r\n" + f"{box}\r\n❯ \r\n{box}\r\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+        )
+        sm._buffers["t1"] = final
+        sm._feed_screen_locked("t1", final)
+        broken_screen = sm._screens["t1"][0]
+        broken_screen.buffer[0][0] = broken_screen.default_char._replace(data="")
+
+        lines, fallback = sm._capture_screen_snapshot("t1")
+
+        assert fallback is None
+        assert sm._screens["t1"][0] is not broken_screen
+        assert provider.get_status_from_screen(lines) == TerminalStatus.COMPLETED
+        sm._screens["t1"][1].feed("\r\nAFTER_REBUILD")
+        assert any("AFTER_REBUILD" in line for line in sm._screens["t1"][0].display)
+
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
-    def test_render_error_falls_back_to_raw_buffer_detection(self, mock_pm):
+    def test_render_and_rebuild_error_falls_back_to_raw_buffer_detection(self, mock_pm):
         class BrokenScreen:
             @property
             def display(self):
@@ -384,7 +407,8 @@ class TestScreenDetection:
         sm._screens["t1"] = (BrokenScreen(), MagicMock())
         sm._buffers["t1"] = "raw buffer with idle footer"
 
-        assert sm._detect_screen("t1", provider) == TerminalStatus.IDLE
+        with patch("pyte.Stream.feed", side_effect=RuntimeError("replay failed")):
+            assert sm._detect_screen("t1", provider) == TerminalStatus.IDLE
         provider.get_status.assert_called_once_with("raw buffer with idle footer")
         mock_pm.get_provider.assert_not_called()
 
