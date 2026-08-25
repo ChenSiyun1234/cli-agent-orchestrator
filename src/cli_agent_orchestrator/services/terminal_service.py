@@ -263,7 +263,11 @@ def restore_persisted_terminal_monitors() -> Dict[str, int]:
 
             # Prime status directly rather than republishing historical output;
             # the append-only terminal log must not duplicate scrollback.
-            history = backend.get_history(session_name, window_name, tail_lines=500)
+            # Seed only the pane's live viewport.  Replaying scrollback into a
+            # fixed pyte screen leaves old provider chrome in rows that a
+            # subsequent cursor-addressed repaint can never overwrite, which
+            # makes an idle restored Claude pane look permanently active.
+            history = backend.get_history(session_name, window_name, tail_lines=0)
             status_monitor.seed_terminal_history(terminal_id, history)
             result["restored"] += 1
         except Exception as exc:  # noqa: BLE001 - one stale pane must not block startup

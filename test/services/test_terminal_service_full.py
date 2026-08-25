@@ -1485,7 +1485,8 @@ class TestRestorePersistedTerminalMonitors:
         backend.session_exists.return_value = True
         # get_history is called three times, in order: the window-existence
         # probe (tail_lines=1), the pre-attach liveness baseline capture
-        # (tail_lines=PIPE_LIVENESS_TAIL_LINES), then the 500-line status seed.
+        # (tail_lines=PIPE_LIVENESS_TAIL_LINES), then the visible-viewport
+        # status seed (tail_lines=0).
         backend.get_history.side_effect = [
             "probe",
             "restore tail baseline",
@@ -1512,6 +1513,9 @@ class TestRestorePersistedTerminalMonitors:
         assert create_kwargs["restore_baseline"] == "restore tail baseline"
         assert backend.get_history.call_args_list[1] == call(
             "cao-session", "worker-abcd", tail_lines=PIPE_LIVENESS_TAIL_LINES
+        )
+        assert backend.get_history.call_args_list[2] == call(
+            "cao-session", "worker-abcd", tail_lines=0
         )
         backend.pipe_pane.assert_called_once()
         # Status is primed by a direct seed, never by replaying scrollback back
