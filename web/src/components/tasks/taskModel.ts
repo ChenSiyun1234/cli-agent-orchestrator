@@ -45,6 +45,8 @@ export interface HydratedTerminal extends TerminalMeta {
   group?: string[] | null
   metadata?: Record<string, unknown> | null
   status?: string | null
+  /** Whether GET /terminals/{id} still resolves to a live CAO record. */
+  reachable?: boolean
 }
 
 export interface WorkflowEvidence {
@@ -376,13 +378,24 @@ function directTaskState(
   // evidence of an incomplete old record, not evidence that work is still
   // running today.
   if (supersededHistorical) return 'historical_unresolved'
-  const states = implementers.map(worker => normalizeState(worker.status))
+  // Session metadata can outlive its tmux pane and retain a stale processing
+  // status.  Only terminals that the live terminal endpoint can still resolve
+  // may contribute an active state.
+  const reachableImplementers = implementers.filter(worker => worker.reachable !== false)
+  const states = reachableImplementers.map(worker => normalizeState(worker.status))
   if (states.includes('waiting_user_answer')) return 'waiting_user_answer'
   if (states.includes('processing')) return 'processing'
   if (states.includes('error')) return 'disconnected'
   if (assignments.every(message => message.status === 'pending')) return 'queued'
-  if (assignments.some(message => message.delivered_at || message.status === 'delivered')) return 'quiet_running'
-  return stateFromWorkers(implementers)
+  // A delivered assignment is not proof that work is quietly continuing.
+  // If its terminal vanished, surface the broken live link.  If the provider
+  // returned to a ready prompt without a persisted handback, surface the
+  // missing handoff instead of inventing activity.  Unknown status remains
+  // unknown so the operator can distinguish telemetry gaps from real work.
+  if (reachableImplementers.length === 0 && assignments.some(message => message.delivered_at || message.status === 'delivered')) return 'disconnected'
+  if (states.some(state => state === 'completed' || state === 'idle')) return 'handoff_missing'
+  if (assignments.some(message => message.delivered_at || message.status === 'delivered')) return 'unknown'
+  return stateFromWorkers(reachableImplementers)
 }
 
 function legacyMessagesForRoot(

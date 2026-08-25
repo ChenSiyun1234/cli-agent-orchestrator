@@ -6,6 +6,7 @@ import { api } from '../api'
 import { relatedInboxEndpointIds } from '../components/tasks/TaskCenter'
 import { buildTaskProjections, inboxEvidenceForTask, parseFiveFieldContract } from '../components/tasks/taskModel'
 import { buildTaskReport } from '../components/tasks/taskReport'
+import { buildWorkflowGraph, extractEvidence } from '../components/GraphWorkspace'
 
 const fixture = vi.hoisted(() => ({
   sessions: [] as any[],
@@ -23,6 +24,10 @@ vi.mock('../api', () => ({
   api: {
     getMemoryStatus: vi.fn(() => Promise.resolve({ enabled: true })),
     listMemories: vi.fn(() => Promise.resolve(fixture.memories)),
+    getMemory: vi.fn((key: string) => Promise.resolve({
+      ...(fixture.memories.find(memory => memory.key === key) || { key, scope: 'project', scope_id: 'unidlq', memory_type: 'project', tags: '', created_at: '', updated_at: '' }),
+      content: `memory body for ${key}`,
+    })),
     listProfiles: vi.fn(() => Promise.resolve([])),
     listSessions: vi.fn(() => Promise.resolve(fixture.sessions)),
     listWorkflowRuns: vi.fn(() => Promise.resolve(fixture.runs)),
@@ -238,7 +243,39 @@ describe('five-field task contract parser', () => {
   })
 })
 
-describe('App shell — Chinese task-first navigation', () => {
+describe('two-graph evidence truthfulness', () => {
+  it('does not let stale session metadata make an unreachable pane look active', () => {
+    persistedDirectTaskFixture(null)
+    fixture.inbox = fixture.inbox.filter(message => message.id === 101)
+    fixture.terminals[1].status = 'processing'
+    fixture.terminals[1].reachable = false
+    const task = buildTaskProjections([], {}, fixture.terminals, fixture.inbox)[0]
+    expect(task.state).toBe('disconnected')
+    expect(buildWorkflowGraph(task).nodes.find(node => node.kind === 'implementer')?.tone).toBe('error')
+  })
+
+  it('does not mistake an assignment base commit for a produced publication', () => {
+    persistedDirectTaskFixture(null)
+    fixture.inbox[0].message += '\nSCOPE NOTE: operate at accepted base commit b9bbb84.'
+    const task = buildTaskProjections([], {}, fixture.terminals, fixture.inbox)[0]
+    const graph = buildWorkflowGraph(task)
+    const publish = graph.nodes.find(node => node.kind === 'publish')
+    expect(publish?.subtitle).toBe('没有结构化 Git 证据')
+    expect(publish?.status).toBe('审核通过后执行')
+    expect(Math.max(...graph.nodes.map(node => node.x + node.width))).toBeLessThanOrEqual(graph.width)
+    expect(graph.width).toBeLessThanOrEqual(1200)
+  })
+
+  it('extracts explicit durable evidence without inventing categories', () => {
+    expect(extractEvidence('commit abcdef123456\n92 passed, 1 skipped\nrun augr-s0-tiny-20260825')).toEqual([
+      { kind: 'commit', value: 'abcdef123456' },
+      { kind: 'test', value: '92 passed, 1 skipped' },
+      { kind: 'run', value: 'augr-s0-tiny-20260825' },
+    ])
+  })
+})
+
+describe('App shell — two-graph operator console', () => {
   beforeEach(() => {
     fixture.sessions = []
     fixture.terminals = []
@@ -253,36 +290,38 @@ describe('App shell — Chinese task-first navigation', () => {
     vi.clearAllMocks()
   })
 
-  it('keeps the CAO brand and presents the operator-facing project console', async () => {
+  it('presents exactly the workflow and memory/evidence graph surfaces', async () => {
     render(<App />)
-    expect(screen.getByText('CLI Agent Orchestrator')).toBeInTheDocument()
-    expect(screen.getByText('UniDLQ 项目控制台 · 任务、智能体、证据与报告集中监督')).toBeInTheDocument()
-    await screen.findByText('CAO 记忆库')
+    expect(screen.getByText('UniDLQ 全景监督图')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '工作流动态图' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '记忆 / 证据动态图' })).toBeInTheDocument()
+    expect(screen.queryByRole('tablist')).not.toBeInTheDocument()
   })
 
-  it('preserves all six original surfaces in their original order with Chinese task-first labels', async () => {
+  it('keeps operational truth inside graph nodes instead of restoring the old navigation tabs', async () => {
     render(<App />)
-    await screen.findByText('CAO 记忆库')
-    const tabs = screen.getAllByRole('tab')
-    expect(tabs.map(tab => tab.textContent)).toEqual(NAV_LABELS)
-    tabs.forEach((tab, index) => expect(tab).toHaveAttribute('title', `Alt+${index + 1}`))
+    await screen.findByText(/实时 ·/)
+    expect(screen.getByText('串行事件驱动 · 无模型轮询')).toBeInTheDocument()
+    expect(screen.queryByText('智能体与终端')).not.toBeInTheDocument()
+    expect(screen.queryByText('系统设置')).not.toBeInTheDocument()
   })
 
-  it('keeps Memory fail-closed and leaves the other native tabs usable', async () => {
-    vi.mocked(api.getMemoryStatus).mockRejectedValueOnce(new Error('backend down'))
+  it('shows an explicit memory gap node instead of an empty memory tab', async () => {
+    persistedDirectTaskFixture()
+    fixture.memories = []
     render(<App />)
-    const workflows = await screen.findByText('工作流原始记录')
-    expect(screen.queryByText('CAO 记忆库')).not.toBeInTheDocument()
-    expect(workflows.closest('button')).toHaveAttribute('title', 'Alt+5')
+    expect(await screen.findByText('项目记忆库目前为空')).toBeInTheDocument()
+    expect(screen.getByText('这不是“没有发生任何工作”')).toBeInTheDocument()
   })
 
-  it('keeps the session-count badge and horizontally scrollable tab bar', async () => {
-    fixture.sessions = [{ id: 's1', name: 'cao-unidlq-architect', status: 'idle' }]
-    store.sessions = fixture.sessions
+  it('draws separate architect and Claude nodes and exposes details by clicking a node', async () => {
+    persistedDirectTaskFixture(null)
     render(<App />)
-    const agentsTab = (await screen.findByText('智能体与终端')).closest('button') as HTMLElement
-    expect(within(agentsTab).getByText('1')).toBeInTheDocument()
-    expect(screen.getByRole('tablist').className).toContain('overflow-x-auto')
+    const architect = await screen.findByText('S0 架构与验收')
+    expect(screen.getByText('S0 数据实现者')).toBeInTheDocument()
+    fireEvent.click(architect.closest('button') as HTMLElement)
+    expect(screen.getByRole('dialog', { name: /节点详情/ })).toBeInTheDocument()
+    expect(screen.getByText('打开真实终端')).toBeInTheDocument()
   })
 })
 
@@ -505,7 +544,7 @@ describe('Task center — graphical supervision and native controls', () => {
 
     const task = buildTaskProjections([], {}, fixture.terminals, fixture.inbox)[0]
     expect(task.kind).toBe('direct')
-    expect(task.state).toBe('quiet_running')
+    expect(task.state).toBe('handoff_missing')
     expect(task.subtitle).toContain('历史推定关联')
     expect(JSON.stringify(task)).not.toContain('frozen')
     expect(buildTaskReport(task, fixture.inbox).unresolved_risks).toContain(
@@ -561,7 +600,7 @@ describe('Task center — graphical supervision and native controls', () => {
     const oldTask = tasks.find(task => task.title === 'old unpaired task')
     const newerTask = tasks.find(task => task.title === 'newer task')
     expect(oldTask?.state).toBe('historical_unresolved')
-    expect(newerTask?.state).toBe('quiet_running')
+    expect(newerTask?.state).toBe('handoff_missing')
   })
 
   it('renders the task memory graph and evidence-backed report with both download formats', async () => {

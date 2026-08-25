@@ -18,6 +18,7 @@ const STATUS_ZH: Record<string, string> = {
   idle: '可接收指令',
   waiting_user_answer: '等待人工回答',
   quiet_running: '安静运行中',
+  handoff_missing: '本轮停止，但回报未登记',
   returned: '已返回，待审核',
   disconnected: '终端已断开',
   error: '发生错误',

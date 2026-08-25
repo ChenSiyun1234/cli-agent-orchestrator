@@ -16,3 +16,24 @@ body {
   outline-offset: 2px;
 }
 
+@keyframes graph-dash {
+  to { stroke-dashoffset: -28; }
+}
+
+.graph-edge-active {
+  stroke-dasharray: 9 6;
+  animation: graph-dash 1.2s linear infinite;
+}
+
+.graph-scroll {
+  scrollbar-color: #334155 #0f172a;
+  scrollbar-width: thin;
+}
+
+.graph-edge-label {
+  paint-order: stroke;
+  stroke: #070b14;
+  stroke-width: 4px;
+  stroke-linejoin: round;
+}
+
