@@ -755,6 +755,28 @@ class StatusMonitor:
             self._allow_processing_revert[terminal_id] = True
             self._ready_processing_samples.pop(terminal_id, None)
 
+    def mark_terminal_error(self, terminal_id: str) -> None:
+        """Latch an authoritative terminal-lifecycle failure.
+
+        A missing tmux session/window cannot produce another FIFO chunk, so the
+        normal detector pipeline has no way to leave its cached status.  Bump
+        the generation before publishing ERROR so any detection already in
+        flight is stale, and tear down the per-turn debounce state without
+        deleting the retained terminal's buffer or provider evidence.
+
+        Safe to call repeatedly: each call invalidates older work, while
+        ``_apply_detection`` publishes ERROR only on the first transition.
+        """
+        with self._lock:
+            self._input_generation[terminal_id] = self._input_generation.get(terminal_id, 0) + 1
+            generation = self._input_generation[terminal_id]
+            self._allow_processing_revert.pop(terminal_id, None)
+            self._ready_processing_samples.pop(terminal_id, None)
+            self._bursting.pop(terminal_id, None)
+            handle = self._quiesce_handle.pop(terminal_id, None)
+        self._cancel_quiesce_handle(handle)
+        self._apply_detection(terminal_id, TerminalStatus.ERROR, generation)
+
     def is_input_armed(self, terminal_id: str) -> bool:
         """Return whether a newly-sent input still awaits observed processing.
 

@@ -1333,6 +1333,37 @@ class TestQuiescenceTimerCancel:
         sm._loop.call_soon_threadsafe.assert_not_called()
 
 
+class TestMarkTerminalError:
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_invalidates_inflight_detection_and_publishes_once(self, mock_bus):
+        sm = StatusMonitor()
+        handle = MagicMock()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._input_generation["t1"] = 4
+        sm._allow_processing_revert["t1"] = True
+        sm._ready_processing_samples["t1"] = (1, "id", ("spinner_glyph",), ("a",), 0, False)
+        sm._bursting["t1"] = True
+        sm._quiesce_handle["t1"] = handle
+
+        sm.mark_terminal_error("t1")
+        sm.mark_terminal_error("t1")
+
+        assert sm._input_generation["t1"] == 6
+        assert sm._last_status["t1"] == TerminalStatus.ERROR
+        assert "t1" not in sm._allow_processing_revert
+        assert "t1" not in sm._ready_processing_samples
+        assert "t1" not in sm._bursting
+        assert "t1" not in sm._quiesce_handle
+        handle.cancel.assert_called_once()
+        mock_bus.publish.assert_called_once_with("terminal.t1.status", {"status": "error"})
+
+        # A detector that began before the lifecycle failure cannot revive the
+        # terminal after its tmux pane has authoritatively disappeared.
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, generation=4)
+        assert sm._last_status["t1"] == TerminalStatus.ERROR
+        mock_bus.publish.assert_called_once()
+
+
 class TestRestoredHistoryScreenSeed:
     """A tmux capture-pane snapshot must render like the pane it came from."""
 

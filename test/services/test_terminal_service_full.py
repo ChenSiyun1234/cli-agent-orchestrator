@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+from cli_agent_orchestrator.clients.tmux import TmuxLookupError
 from cli_agent_orchestrator.constants import PIPE_LIVENESS_TAIL_LINES
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -66,6 +67,97 @@ class TestCreateTerminal:
         assert result.id == "test1234"
         mock_tmux.create_session.assert_called_once()
         mock_provider.initialize.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_pane_probe_propagates_authoritative_missing_window(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        backend,
+        mock_db_create,
+        providers,
+        mock_fifo_dir,
+        fifos,
+        monitor,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        backend.session_exists.return_value = False
+        backend.supports_event_inbox.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        provider = AsyncMock()
+        provider.initialize.return_value = True
+        providers.create_provider.return_value = provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal("kiro_cli", "developer", new_session=True)
+        probe = fifos.create_reader.call_args.kwargs["pane_probe"]
+        backend.get_history.side_effect = ValueError("Window 'developer-abcd' not found")
+
+        with pytest.raises(ValueError, match="not found"):
+            probe()
+
+        monitor.mark_terminal_error.assert_called_once_with("test1234")
+        fifos.stop_reader.assert_called_once_with("test1234")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_pane_probe_preserves_lookup_uncertainty(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        backend,
+        mock_db_create,
+        providers,
+        mock_fifo_dir,
+        fifos,
+        monitor,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        backend.session_exists.return_value = False
+        backend.supports_event_inbox.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        provider = AsyncMock()
+        provider.initialize.return_value = True
+        providers.create_provider.return_value = provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal("kiro_cli", "developer", new_session=True)
+        probe = fifos.create_reader.call_args.kwargs["pane_probe"]
+
+        for exc in (TmuxLookupError("could not parse"), RuntimeError("tmux unavailable")):
+            backend.get_history.side_effect = exc
+            with pytest.raises(type(exc), match=str(exc)):
+                probe()
+
+        monitor.mark_terminal_error.assert_not_called()
+        fifos.stop_reader.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service._schedule_deferred_init")
@@ -1428,11 +1520,47 @@ class TestRestorePersistedTerminalMonitors:
         backend.send_keys.assert_not_called()
         backend.send_special_key.assert_not_called()
 
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.list_all_terminals")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_missing_tmux_session_is_retained_and_skipped(self, backend, list_terminals):
+    def test_restored_pane_probe_propagates_authoritative_missing_window(
+        self, backend, list_terminals, providers, fifos, monitor
+    ):
         backend.supports_event_inbox.return_value = False
-        backend.session_exists.return_value = False
+        backend.get_history.side_effect = ["probe", "restore baseline", "settled history"]
+        list_terminals.return_value = [
+            {
+                "id": "abc12345",
+                "tmux_session": "cao-session",
+                "tmux_window": "worker-abcd",
+            }
+        ]
+
+        assert restore_persisted_terminal_monitors() == {
+            "restored": 1,
+            "skipped": 0,
+            "failed": 0,
+        }
+        probe = fifos.create_reader.call_args.kwargs["pane_probe"]
+        backend.get_history.side_effect = ValueError("Window 'worker-abcd' not found")
+
+        with pytest.raises(ValueError, match="not found"):
+            probe()
+
+        monitor.mark_terminal_error.assert_called_once_with("abc12345")
+        fifos.stop_reader.assert_called_once_with("abc12345")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.list_all_terminals")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_missing_tmux_session_is_retained_marked_error_and_skipped(
+        self, backend, list_terminals, fifos, monitor
+    ):
+        backend.supports_event_inbox.return_value = False
+        backend.get_history.side_effect = ValueError("Session 'gone' not found")
         list_terminals.return_value = [
             {"id": "old12345", "tmux_session": "gone", "tmux_window": "worker"}
         ]
@@ -1442,6 +1570,31 @@ class TestRestorePersistedTerminalMonitors:
             "skipped": 1,
             "failed": 0,
         }
+        monitor.mark_terminal_error.assert_called_once_with("old12345")
+        fifos.stop_reader.assert_called_once_with("old12345")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.list_all_terminals")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_restore_lookup_uncertainty_does_not_mark_terminal_gone(
+        self, backend, list_terminals, fifos, monitor
+    ):
+        backend.supports_event_inbox.return_value = False
+        list_terminals.return_value = [
+            {"id": "old12345", "tmux_session": "maybe", "tmux_window": "worker"}
+        ]
+
+        for exc in (TmuxLookupError("could not parse"), RuntimeError("tmux unavailable")):
+            backend.get_history.side_effect = exc
+            assert restore_persisted_terminal_monitors() == {
+                "restored": 0,
+                "skipped": 0,
+                "failed": 1,
+            }
+
+        monitor.mark_terminal_error.assert_not_called()
+        fifos.stop_reader.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.terminal_service.list_all_terminals")
     @patch("cli_agent_orchestrator.backends.registry._backend")

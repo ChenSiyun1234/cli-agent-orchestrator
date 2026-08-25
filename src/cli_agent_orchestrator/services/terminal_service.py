@@ -204,17 +204,35 @@ def restore_persisted_terminal_monitors() -> Dict[str, int]:
         window_name = terminal["tmux_window"]
         reader_started = False
         try:
-            if not backend.session_exists(session_name):
+            # One direct pane read distinguishes authoritative absence (plain
+            # ValueError) from tmux lookup uncertainty (TmuxLookupError /
+            # RuntimeError).  session_exists() cannot preserve that distinction
+            # because some legacy non-parse failures are represented as False.
+            try:
+                backend.get_history(session_name, window_name, tail_lines=1)
+            except ValueError as exc:
+                status_monitor.mark_terminal_error(terminal_id)
+                fifo_manager.stop_reader(terminal_id)
                 result["skipped"] += 1
+                logger.warning(
+                    "Persisted terminal %s pane is gone (%s:%s): %s",
+                    terminal_id,
+                    session_name,
+                    window_name,
+                    exc,
+                )
                 continue
 
-            # Verify the persisted window still exists before allocating a FIFO.
-            backend.get_history(session_name, window_name, tail_lines=1)
             provider_manager.get_provider(terminal_id)
             fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
-            def _probe_pane(s=session_name, w=window_name) -> str:
-                return backend.get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+            def _probe_pane(s=session_name, w=window_name, tid=terminal_id) -> str:
+                try:
+                    return backend.get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+                except ValueError:
+                    status_monitor.mark_terminal_error(tid)
+                    fifo_manager.stop_reader(tid)
+                    raise
 
             def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
                 backend.stop_pipe_pane(s, w)
@@ -578,8 +596,13 @@ async def create_terminal(
             # NOT a bare pipe_pane() — a stalled pane still reports pane_pipe=1,
             # so the backend's ``pipe-pane -o`` toggle would just switch the
             # dead pipe OFF instead of restarting it.
-            def _probe_pane(s=session_name, w=window_name) -> str:
-                return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+            def _probe_pane(s=session_name, w=window_name, tid=terminal_id) -> str:
+                try:
+                    return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+                except ValueError:
+                    status_monitor.mark_terminal_error(tid)
+                    fifo_manager.stop_reader(tid)
+                    raise
 
             def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
                 get_backend().stop_pipe_pane(s, w)
