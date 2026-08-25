@@ -367,17 +367,31 @@ function directTaskState(
   returns: InboxMessage[],
   implementers: HydratedTerminal[],
   verdict: ReviewVerdict,
-  supersededHistorical: boolean,
+  supersededByLaterTask: boolean,
 ): string {
-  if (verdict === 'REJECT') return 'failed'
-  if (verdict === 'ACCEPT') return 'completed'
-  if (returns.length) return 'returned'
+  const latestAssignment = [...assignments].sort((a, b) => messageTime(b) - messageTime(a))[0]
+  const latestReturns = latestAssignment
+    ? returns.filter(message => (
+      message.sender_id === latestAssignment.receiver_id
+      && (message.reply_to_message_id == null || String(message.reply_to_message_id) === String(latestAssignment.id))
+    ))
+    : returns
+  // A five-field reply-to packet after REJECT is a new immutable amendment
+  // round.  The prior verdict remains evidence, but it must not make the live
+  // task look terminal while the new packet is queued or executing.
+  const amendmentOpen = verdict === 'REJECT'
+    && assignments.length > 1
+    && latestAssignment?.reply_to_message_id != null
+    && latestReturns.length === 0
+  if (!amendmentOpen && verdict === 'REJECT') return 'failed'
+  if (!amendmentOpen && verdict === 'ACCEPT') return 'completed'
+  if (!amendmentOpen && returns.length) return 'returned'
   if (assignments.some(message => message.status === 'failed')) return 'failed'
-  // Old inbox rows had no task_id/reply link. Once a later assignment exists
-  // for the same architect/implementer pair, an unpaired historical root is
-  // evidence of an incomplete old record, not evidence that work is still
+  // Once a later task exists for the same architect/implementer pair, an open
+  // older round is historical evidence, not evidence that work is still
   // running today.
-  if (supersededHistorical) return 'historical_unresolved'
+  if (supersededByLaterTask) return 'historical_unresolved'
+  if (amendmentOpen && latestAssignment.status === 'pending') return 'queued'
   // Session metadata can outlive its tmux pane and retain a stale processing
   // status.  Only terminals that the live terminal endpoint can still resolve
   // may contribute an active state.
@@ -516,8 +530,9 @@ export function buildTaskProjections(
     const first = assignments[0]
     const contract = parseFiveFieldContract(first.message) as FiveFieldContract
     const latestAssignment = [...assignments].sort((a, b) => messageTime(b) - messageTime(a))[0]
-    const supersededHistorical = historical && taskRoots.some(candidate => (
-      messageTime(candidate) > messageTime(latestAssignment)
+    const supersededByLaterTask = taskRoots.some(candidate => (
+      !rootIds.has(messageKey(candidate))
+      && messageTime(candidate) > messageTime(latestAssignment)
       && candidate.sender_id === latestAssignment.sender_id
       && candidate.receiver_id === latestAssignment.receiver_id
     ))
@@ -537,20 +552,21 @@ export function buildTaskProjections(
       reviewedAt,
       binding: historical ? 'historical-inference' : 'persisted-task-id',
     }
+    const state = directTaskState(
+      assignments,
+      returnMessages,
+      implementers,
+      verdict,
+      supersededByLaterTask,
+    )
     return {
       id: `direct:${taskId}`,
       kind: 'direct' as const,
       title: contract.goal.split(/\r?\n/)[0].slice(0, 90),
       subtitle: `${taskId} · ${historical ? '历史推定关联' : '持久任务关联'}`,
-      state: directTaskState(
-        assignments,
-        returnMessages,
-        implementers,
-        verdict,
-        supersededHistorical,
-      ),
+      state,
       startedAt: first.created_at,
-      finishedAt: reviewedAt || returnedAt,
+      finishedAt: ['completed', 'failed'].includes(state) ? reviewedAt || returnedAt : null,
       run: null,
       evidence: null,
       direct: directEvidence,

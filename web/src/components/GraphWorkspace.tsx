@@ -187,6 +187,7 @@ function terminalNode(
   terminal: HydratedTerminal | undefined,
   x: number,
   y: number,
+  hasPersistedHandback = false,
 ): PositionedNode {
   const { role, kind } = terminalRole(terminal, terminalId)
   if (!terminal) {
@@ -204,16 +205,19 @@ function terminalNode(
   }
   const launch = workerLaunchObservation(terminal, task)
   const reachable = terminal.reachable !== false && normalizeState(terminal.status) !== 'error'
+  const displayedState = hasPersistedHandback ? 'returned' : terminal.status
   return {
     id: `terminal:${terminal.id}`,
     kind,
     title: role,
     subtitle: `${terminal.provider} · ${terminal.id.slice(0, 8)}`,
-    status: reachable ? statusLabel(terminal.status) : '终端已退出，证据保留',
-    tone: reachable ? toneFromState(terminal.status) : 'error',
+    status: reachable ? statusLabel(displayedState) : '终端已退出，证据保留',
+    tone: reachable ? toneFromState(displayedState) : 'error',
     timestamp: terminal.last_active,
     body: reachable
-      ? '这是 CAO 当前返回的真实终端节点。点击“打开真实终端”会建立到同一 tmux pane 的双向 PTY，不复制终端内容到本图。'
+      ? hasPersistedHandback
+        ? '该实现者已经产生与本任务绑定的持久最终回报。即使终端状态采样仍短暂显示 processing，工作流节点也以最终回报事件为准；点击“打开真实终端”仍会连接同一 tmux pane。'
+        : '这是 CAO 当前返回的真实终端节点。点击“打开真实终端”会建立到同一 tmux pane 的双向 PTY，不复制终端内容到本图。'
       : 'CAO 仍保留这条终端记录，但对应 tmux pane 已不存在。实时终端无法打开；任务消息、报告和审计证据不会因此删除。',
     meta: {
       终端: terminal.id,
@@ -223,6 +227,8 @@ function terminalNode(
       模型: launch.model.value || '未观测',
       推理强度: launch.reasoningEffort.value || '未观测',
       上游终端: terminal.caller_id || '无 / 未观测',
+      终端原始状态: statusLabel(terminal.status),
+      持久最终回报: hasPersistedHandback ? '已观测' : '未观测',
       最近活动: formatTime(terminal.last_active),
       可打开: reachable ? '是' : '否',
     },
@@ -331,16 +337,21 @@ export function buildWorkflowGraph(task: TaskProjection | null): GraphSnapshot {
     })
     edges.push(makeEdge(architectVisual.id, handoffId, '正式派发', handoffTone))
 
-    const worker = task.workers.find(item => item.id === assignment.receiver_id)
-    const workerVisual = terminalNode(task, assignment.receiver_id, worker, 520, y)
-    workerVisual.width = 155
-    nodes.push(workerVisual)
-    edges.push(makeEdge(handoffId, workerVisual.id, assignment.started_at ? '已开始' : assignment.delivered_at ? '已接收' : '尚未接收', workerVisual.tone))
-
     const report = direct.returnMessages.find(message => (
       message.sender_id === assignment.receiver_id
       && (message.reply_to_message_id == null || String(message.reply_to_message_id) === String(assignment.id))
     ))
+    const worker = task.workers.find(item => item.id === assignment.receiver_id)
+    const workerVisual = terminalNode(task, assignment.receiver_id, worker, 520, y, Boolean(report))
+    workerVisual.width = 155
+    if (!report && assignment.status === 'pending' && workerVisual.tone !== 'error') {
+      workerVisual.status = '等待接收本轮指令'
+      workerVisual.tone = 'warn'
+      workerVisual.body = '本轮五字段任务包已经持久化，但 CAO 尚未把它送入这个终端。终端上一轮的原始状态不代表本轮已经开始。'
+    }
+    nodes.push(workerVisual)
+    edges.push(makeEdge(handoffId, workerVisual.id, assignment.started_at ? '已开始' : assignment.delivered_at ? '已接收' : '尚未接收', workerVisual.tone))
+
     const reportId = `report:${assignment.id}`
     nodes.push({
       id: reportId,
@@ -358,14 +369,22 @@ export function buildWorkflowGraph(task: TaskProjection | null): GraphSnapshot {
     edges.push(makeEdge(workerVisual.id, reportId, report ? '最终交付' : '等待交付', report ? 'done' : 'unknown'))
   })
 
+  const amendmentOpen = assignments.some((assignment, index) => (
+    index > 0
+    && assignment.reply_to_message_id != null
+    && !direct.returnMessages.some(message => (
+      message.sender_id === assignment.receiver_id
+      && (message.reply_to_message_id == null || String(message.reply_to_message_id) === String(assignment.id))
+    ))
+  ))
   const reviewId = `review:${task.id}`
   nodes.push({
     id: reviewId,
     kind: 'review',
     title: '架构师独立审核',
-    subtitle: task.reviewVerdict ? `明确结论 ${task.reviewVerdict}` : '只在实现者最终回报后开始',
-    status: task.reviewVerdict ? `审核 ${task.reviewVerdict}` : direct.returnMessages.length ? '等待 / 正在审核' : '尚未进入审核',
-    tone: task.reviewVerdict === 'ACCEPT' ? 'done' : task.reviewVerdict === 'REJECT' ? 'error' : direct.returnMessages.length ? 'warn' : 'unknown',
+    subtitle: amendmentOpen && task.reviewVerdict === 'REJECT' ? '上一轮 REJECT，修订包已建立' : task.reviewVerdict ? `明确结论 ${task.reviewVerdict}` : '只在实现者最终回报后开始',
+    status: amendmentOpen ? '修订轮次等待 / 正在执行' : task.reviewVerdict ? `审核 ${task.reviewVerdict}` : direct.returnMessages.length ? '等待 / 正在审核' : '尚未进入审核',
+    tone: amendmentOpen ? 'warn' : task.reviewVerdict === 'ACCEPT' ? 'done' : task.reviewVerdict === 'REJECT' ? 'error' : direct.returnMessages.length ? 'warn' : 'unknown',
     timestamp: direct.reviewedAt,
     body: direct.reviewMessages.map(message => message.message).join('\n\n') || '未观察到结构化 ACCEPT / REJECT。审核节点不会根据终端安静或任务文本自行猜测。',
     meta: { 审核结论: task.reviewVerdict || '未观测', 审核时间: formatTime(direct.reviewedAt) },
@@ -377,18 +396,18 @@ export function buildWorkflowGraph(task: TaskProjection | null): GraphSnapshot {
   // Publication evidence must come from the worker handback/review, never
   // from the assignment packet (which often names the base commit).
   const allText = [...direct.returnMessages, ...direct.reviewMessages].map(message => message.message).join('\n')
-  const commit = extractEvidence(allText).find(item => item.kind === 'commit')
+  const publicationCommit = extractPublicationCommit(allText)
   const publishId = `publish:${task.id}`
   nodes.push({
     id: publishId,
     kind: 'publish',
     title: '提交与远端发布',
-    subtitle: commit ? short(commit.value, 44) : '没有结构化 Git 证据',
-    status: task.reviewVerdict === 'ACCEPT' ? commit ? '提交证据已观测' : '已验收，提交未观测' : '审核通过后执行',
-    tone: task.reviewVerdict === 'ACCEPT' ? commit ? 'done' : 'warn' : task.reviewVerdict === 'REJECT' ? 'error' : 'unknown',
+    subtitle: publicationCommit ? short(publicationCommit, 44) : '没有结构化 Git 发布证据',
+    status: amendmentOpen ? '等待修订轮次通过审核' : task.reviewVerdict === 'ACCEPT' ? publicationCommit ? '提交 / 推送证据已观测' : '已验收，发布未观测' : '审核通过后执行',
+    tone: amendmentOpen ? 'unknown' : task.reviewVerdict === 'ACCEPT' ? publicationCommit ? 'done' : 'warn' : task.reviewVerdict === 'REJECT' ? 'error' : 'unknown',
     timestamp: direct.reviewedAt,
-    body: commit?.value || '界面不会因为任务被 ACCEPT 就假装已经提交或推送。只有持久消息/报告里出现明确 Git 证据时，此节点才会变绿。',
-    meta: { 审核: task.reviewVerdict || '未观测', Git证据: commit?.value || '未观测' },
+    body: publicationCommit || '界面不会把“base commit / accepted commit / no commit / no push”误认成发布。只有持久报告明确声明新提交、已提交或已推送并给出哈希时，此节点才会变绿。',
+    meta: { 审核: task.reviewVerdict || '未观测', Git发布证据: publicationCommit || '未观测' },
     task,
     x: 1020, y: middleY, width: 145, height: 98,
   })
@@ -413,6 +432,28 @@ export function extractEvidence(text: string): EvidenceItem[] {
   for (const match of text.matchAll(/\b\d+\s+(?:passed|failed|skipped|xfailed|xpassed)(?:[^\r\n]{0,72})/gi)) add('test', match[0])
   for (const match of text.matchAll(/\b(?:augr|unidlq|cao)[a-z0-9_-]*(?:20\d{6,})[a-z0-9_-]*\b/gi)) add('run', match[0])
   return found.slice(0, 12)
+}
+
+export function extractPublicationCommit(text: string): string | null {
+  // A handback commonly records the accepted/base commit while explicitly
+  // saying that it did not commit or push.  Such lineage is useful evidence,
+  // but it is not publication evidence.
+  const patterns = [
+    /\b(?:created|produced|resulting|new|final)\s+commit(?:\s+(?:is|as))?\s*[:#-]?\s*([0-9a-f]{7,40})\b/i,
+    /\bcommitted(?:\s+and\s+pushed)?(?:\s+(?:as|commit))?\s*[:#-]?\s*([0-9a-f]{7,40})\b/i,
+    /\b(?:pushed|published)(?:\s+commit)?\s*[:#-]?\s*([0-9a-f]{7,40})\b/i,
+    /\bHEAD\s+(?:is\s+now|now|advanced\s+to)\s*[:#-]?\s*([0-9a-f]{7,40})\b/i,
+    /(?:已提交|已推送|提交并推送)[^0-9a-f]{0,24}([0-9a-f]{7,40})\b/i,
+  ]
+  const negative = /\b(?:no|without)\s+(?:new\s+)?commit\b|\bnot\s+committed\b|\b(?:no|without)\s+push\b|\bnot\s+pushed\b|未提交|未推送/i
+  for (const line of text.split(/\r?\n/).reverse()) {
+    if (negative.test(line)) continue
+    for (const pattern of patterns) {
+      const match = line.match(pattern)
+      if (match) return match[1]
+    }
+  }
+  return null
 }
 
 export function buildEvidenceGraph(
@@ -757,7 +798,7 @@ function NodeInspector({
   )
 }
 
-export function GraphWorkspace() {
+export function GraphWorkspace({ embedded = false }: { embedded?: boolean }) {
   const [sessions, setSessions] = useState<Array<{ id: string; name: string; status: string }>>([])
   const [runs, setRuns] = useState<RunSummaryRow[]>([])
   const [evidenceByRun, setEvidenceByRun] = useState<Record<string, WorkflowEvidence>>({})
@@ -850,8 +891,9 @@ export function GraphWorkspace() {
   useEffect(() => {
     if (!tasks.length) return
     if (!selectedTaskId || !tasks.some(task => task.id === selectedTaskId)) {
-      const preferred = tasks.find(task => ACTIVE_STATES.has(normalizeState(task.state))) || tasks[0]
-      setSelectedTaskId(preferred.id)
+      // Projections are newest-first.  An old unresolved inbox record must not
+      // steal the landing view from the latest UniDLQ task.
+      setSelectedTaskId(tasks[0].id)
     }
   }, [tasks, selectedTaskId])
   const selectedTask = tasks.find(task => task.id === selectedTaskId) || null
@@ -896,15 +938,30 @@ export function GraphWorkspace() {
     return ids
   }, [selectedTask])
 
+  const activeRoundImplementerIds = new Set(
+    selectedTask?.direct?.assignmentMessages
+      .filter(assignment => {
+        const returned = selectedTask.direct?.returnMessages.some(message => (
+          message.sender_id === assignment.receiver_id
+          && (message.reply_to_message_id == null || String(message.reply_to_message_id) === String(assignment.id))
+        ))
+        return !returned && Boolean(assignment.delivered_at || assignment.started_at)
+      })
+      .map(assignment => assignment.receiver_id) || [],
+  )
   const activeArchitects = selectedTask?.workers.filter(worker => terminalRole(worker, worker.id).kind === 'architect' && normalizeState(worker.status) === 'processing') || []
-  const activeImplementers = selectedTask?.workers.filter(worker => terminalRole(worker, worker.id).kind === 'implementer' && normalizeState(worker.status) === 'processing') || []
+  const activeImplementers = selectedTask?.workers.filter(worker => (
+    terminalRole(worker, worker.id).kind === 'implementer'
+    && normalizeState(worker.status) === 'processing'
+    && (selectedTask.kind !== 'direct' || activeRoundImplementerIds.has(worker.id))
+  )) || []
   const overlap = activeArchitects.length > 0 && activeImplementers.length > 0
   const activeTasks = tasks.filter(task => ACTIVE_STATES.has(normalizeState(task.state))).length
   const selectedRunningAgents = activeArchitects.length + activeImplementers.length
 
   return (
-    <div className="min-h-screen bg-[#070a11] text-slate-200">
-      <header className="sticky top-0 z-40 border-b border-slate-800/90 bg-[#090d16]/95 backdrop-blur-xl">
+    <div className={embedded ? 'text-slate-200' : 'min-h-screen bg-[#070a11] text-slate-200'}>
+      {!embedded ? <header className="sticky top-0 z-40 border-b border-slate-800/90 bg-[#090d16]/95 backdrop-blur-xl">
         <div className="mx-auto flex max-w-[1900px] flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-6">
           <div className="flex items-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-cyan-400 to-emerald-600 text-slate-950 shadow-[0_0_32px_rgba(45,212,191,.18)]"><Network size={21} /></div>
@@ -916,9 +973,18 @@ export function GraphWorkspace() {
             <button disabled={refreshing} onClick={() => refresh(true)} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-slate-300 hover:border-slate-500 disabled:opacity-50"><RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} />立即刷新</button>
           </div>
         </div>
-      </header>
+      </header> : (
+        <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-700/70 bg-[#090d16] px-4 py-3">
+          <div><div className="flex items-center gap-2 text-sm font-semibold text-white"><Network size={16} className="text-cyan-300" />UniDLQ 全景监督图</div><p className="mt-1 text-[11px] text-slate-500">任务中心已替换为动态图；CAO 其余原生功能保留在上方标签。</p></div>
+          <div className="flex flex-wrap items-center gap-2 text-[11px]">
+            <span className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 ${connected ? 'border-emerald-500/35 bg-emerald-950/30 text-emerald-300' : 'border-rose-500/40 bg-rose-950/30 text-rose-300'}`}><span className={`h-2 w-2 rounded-full ${connected ? 'bg-emerald-300' : 'bg-rose-300'}`} />{connected ? `实时 · ${relativeTime(lastSync)}` : '连接中断'}</span>
+            <span className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 ${overlap ? 'border-amber-500/45 bg-amber-950/30 text-amber-200' : 'border-cyan-500/30 bg-cyan-950/25 text-cyan-200'}`}>{overlap ? <AlertTriangle size={12} /> : <Clock3 size={12} />}{overlap ? '观测到架构师与实现者同时 processing' : '串行事件驱动 · 无模型轮询'}</span>
+            <button disabled={refreshing} onClick={() => refresh(true)} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-slate-300 hover:border-slate-500 disabled:opacity-50"><RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} />立即刷新</button>
+          </div>
+        </div>
+      )}
 
-      <main className="mx-auto max-w-[1900px] space-y-5 px-4 py-5 sm:px-6">
+      <main className={embedded ? 'space-y-5' : 'mx-auto max-w-[1900px] space-y-5 px-4 py-5 sm:px-6'}>
         {loadError ? <div role="alert" className="rounded-xl border border-rose-500/40 bg-rose-950/25 px-4 py-3 text-sm text-rose-200">{loadError}。画面保留最后一次成功快照，不会伪装成实时。</div> : null}
         <section className="rounded-3xl border border-slate-700/70 bg-slate-900/45 p-4 shadow-[0_24px_80px_rgba(0,0,0,.22)]" aria-labelledby="workflow-graph-title">
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">

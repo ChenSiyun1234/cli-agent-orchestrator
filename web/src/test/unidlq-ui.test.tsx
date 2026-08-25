@@ -6,7 +6,7 @@ import { api } from '../api'
 import { relatedInboxEndpointIds } from '../components/tasks/TaskCenter'
 import { buildTaskProjections, inboxEvidenceForTask, parseFiveFieldContract } from '../components/tasks/taskModel'
 import { buildTaskReport } from '../components/tasks/taskReport'
-import { buildWorkflowGraph, extractEvidence } from '../components/GraphWorkspace'
+import { buildWorkflowGraph, extractEvidence, extractPublicationCommit } from '../components/GraphWorkspace'
 
 const fixture = vi.hoisted(() => ({
   sessions: [] as any[],
@@ -260,10 +260,54 @@ describe('two-graph evidence truthfulness', () => {
     const task = buildTaskProjections([], {}, fixture.terminals, fixture.inbox)[0]
     const graph = buildWorkflowGraph(task)
     const publish = graph.nodes.find(node => node.kind === 'publish')
-    expect(publish?.subtitle).toBe('没有结构化 Git 证据')
+    expect(publish?.subtitle).toBe('没有结构化 Git 发布证据')
     expect(publish?.status).toBe('审核通过后执行')
     expect(Math.max(...graph.nodes.map(node => node.x + node.width))).toBeLessThanOrEqual(graph.width)
     expect(graph.width).toBeLessThanOrEqual(1200)
+  })
+
+  it('treats a persisted final handback as stronger than a lagging processing sample', () => {
+    persistedDirectTaskFixture(null)
+    fixture.terminals[1].status = 'processing'
+    const task = buildTaskProjections([], {}, fixture.terminals, fixture.inbox)[0]
+    const worker = buildWorkflowGraph(task).nodes.find(node => node.kind === 'implementer')
+    expect(worker?.status).toBe('已回报，等待审核')
+    expect(worker?.tone).toBe('done')
+  })
+
+  it('shows a rejected round with a pending five-field amendment as queued, not terminal failure', () => {
+    persistedDirectTaskFixture(null)
+    fixture.inbox[0].review_verdict = 'REJECT'
+    fixture.inbox[0].reviewed_at = '2026-08-23T10:09:00Z'
+    fixture.inbox.push({
+      id: 104,
+      sender_id: 'aaaaaaaa',
+      receiver_id: 'bbbbbbbb',
+      message: 'GOAL: amend the rejected round\nEFFORT: high\nSCOPE: web/src\nSTOP WHEN: tests fail\nRETURN: evidence',
+      status: 'pending',
+      created_at: '2026-08-23T10:08:59Z',
+      delivered_at: null,
+      started_at: null,
+      reviewed_at: null,
+      task_id: 'direct-101',
+      reply_to_message_id: 101,
+      review_verdict: 'REJECT',
+    })
+    const task = buildTaskProjections([], {}, fixture.terminals, fixture.inbox)[0]
+    const workers = buildWorkflowGraph(task).nodes.filter(node => node.kind === 'implementer')
+    expect(task.state).toBe('queued')
+    expect(workers.map(node => node.status)).toEqual(['已回报，等待审核', '等待接收本轮指令'])
+    expect(buildWorkflowGraph(task).nodes.find(node => node.kind === 'review')?.status).toBe('修订轮次等待 / 正在执行')
+  })
+
+  it('does not mistake a no-commit handback base hash for publication', () => {
+    persistedDirectTaskFixture(null)
+    fixture.inbox[1].message = 'HANDBACK complete. Review candidate at base commit b9bbb84. No commit, no push.'
+    const task = buildTaskProjections([], {}, fixture.terminals, fixture.inbox)[0]
+    expect(buildWorkflowGraph(task).nodes.find(node => node.kind === 'publish')?.subtitle).toBe('没有结构化 Git 发布证据')
+    expect(extractPublicationCommit(fixture.inbox[1].message)).toBeNull()
+    expect(extractPublicationCommit('Committed and pushed as abcdef123456.')).toBe('abcdef123456')
+    expect(extractPublicationCommit('No commit, no push.\nCommitted and pushed as fedcba987654.')).toBe('fedcba987654')
   })
 
   it('extracts explicit durable evidence without inventing categories', () => {
@@ -275,7 +319,7 @@ describe('two-graph evidence truthfulness', () => {
   })
 })
 
-describe('App shell — two-graph operator console', () => {
+describe('App shell — native CAO frame with graphical task centre', () => {
   beforeEach(() => {
     fixture.sessions = []
     fixture.terminals = []
@@ -290,20 +334,21 @@ describe('App shell — two-graph operator console', () => {
     vi.clearAllMocks()
   })
 
-  it('presents exactly the workflow and memory/evidence graph surfaces', async () => {
+  it('keeps every native CAO surface and embeds both graphs in the task centre', async () => {
     render(<App />)
-    expect(screen.getByText('UniDLQ 全景监督图')).toBeInTheDocument()
+    await screen.findByText('CAO 记忆库')
+    expect(screen.getByText('CLI Agent Orchestrator')).toBeInTheDocument()
+    expect(screen.getAllByRole('tab').map(tab => tab.textContent)).toEqual(NAV_LABELS)
     expect(screen.getByRole('heading', { name: '工作流动态图' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: '记忆 / 证据动态图' })).toBeInTheDocument()
-    expect(screen.queryByRole('tablist')).not.toBeInTheDocument()
   })
 
-  it('keeps operational truth inside graph nodes instead of restoring the old navigation tabs', async () => {
+  it('keeps the serial truth banner alongside the original operational tabs', async () => {
     render(<App />)
     await screen.findByText(/实时 ·/)
     expect(screen.getByText('串行事件驱动 · 无模型轮询')).toBeInTheDocument()
-    expect(screen.queryByText('智能体与终端')).not.toBeInTheDocument()
-    expect(screen.queryByText('系统设置')).not.toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /智能体与终端/ })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: '系统设置' })).toBeInTheDocument()
   })
 
   it('shows an explicit memory gap node instead of an empty memory tab', async () => {
