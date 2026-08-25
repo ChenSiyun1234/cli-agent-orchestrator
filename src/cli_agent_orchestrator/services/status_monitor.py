@@ -471,6 +471,7 @@ class StatusMonitor:
                 generation = self._input_generation.get(terminal_id, 0)
         snapshot = self._capture_screen_snapshot(terminal_id)
         detected = self._detect_screen(terminal_id, provider, snapshot)
+        detected = self._guard_unconfirmed_screen_ready(terminal_id, provider, detected)
         confirmed = self._screen_confirms_processing(
             terminal_id,
             provider,
@@ -484,6 +485,43 @@ class StatusMonitor:
             generation,
             confirmed_processing=confirmed,
         )
+        return detected
+
+    def _guard_unconfirmed_screen_ready(
+        self,
+        terminal_id: str,
+        provider,
+        detected: TerminalStatus,
+    ) -> TerminalStatus:
+        """Keep a busy turn busy when only its stale ready screen is visible.
+
+        Claude's spinner is erased in place before the new response is painted.
+        During that brief settled frame pyte can still show the previous turn's
+        response and ready composer.  A provider with a dispatch baseline can
+        explicitly reject that frame using the raw rolling stream. Providers
+        that do not support the check return ``None`` and retain the historical
+        screen-only behavior.
+        """
+        if detected not in (TerminalStatus.COMPLETED, TerminalStatus.IDLE):
+            return detected
+        with self._lock:
+            if self._last_status.get(terminal_id) != TerminalStatus.PROCESSING:
+                return detected
+            buffer = self._buffers.get(terminal_id, "")
+        if provider is None:
+            return detected
+        try:
+            confirmed = provider.confirms_current_turn_completion(buffer)
+        except Exception:
+            logger.exception("Error confirming current-turn completion for %s", terminal_id)
+            return detected
+        if confirmed is False:
+            logger.debug(
+                "Keeping %s processing: rendered %s frame is not current-turn completion",
+                terminal_id,
+                detected.value,
+            )
+            return TerminalStatus.PROCESSING
         return detected
 
     def _schedule_screen_detection(self, terminal_id: str, provider) -> None:
@@ -896,6 +934,8 @@ class StatusMonitor:
                 if use_screen
                 else self._detect_status(terminal_id, buffer)
             )
+            if use_screen:
+                fresh = self._guard_unconfirmed_screen_ready(terminal_id, provider, fresh)
             logger.debug(
                 f"get_status [{terminal_id}]: cached={cached.value}, "
                 f"fresh={fresh.value}, detector={'screen' if use_screen else 'raw'}, "

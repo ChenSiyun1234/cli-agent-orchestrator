@@ -357,6 +357,92 @@ class TestScreenDetection:
         sm._detect_and_apply_screen("t1", provider)
         assert sm._last_status["t1"] == TerminalStatus.COMPLETED
 
+    def test_erased_new_turn_spinner_cannot_reuse_previous_ready_frame(self):
+        """A settled spinner erase is not proof that the new turn completed.
+
+        This replays the observed Claude/pyte ordering: the previous response
+        and ready composer remain on screen, a new-turn spinner briefly proves
+        PROCESSING, then a standalone erase removes only that spinner before the
+        new response is painted. Both the quiescence and poll paths must retain
+        PROCESSING until the raw post-dispatch stream proves a new completion.
+        """
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        provider = ClaudeCodeProvider("t1", "s", "w")
+        provider._initialized = True
+        box = "─" * 20
+        old_ready = (
+            "\x1b[H\x1b[2J"
+            "● PREVIOUS_RESPONSE\r\n"
+            "✻ Worked for 1s\r\n" + f"{box}\r\n❯ \r\n{box}\r\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+        )
+        backend.get_history.return_value = old_ready
+
+        with (
+            patch(
+                "cli_agent_orchestrator.backends.registry.get_backend",
+                return_value=backend,
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.claude_code.get_backend",
+                return_value=backend,
+            ),
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm,
+        ):
+            mock_pm.get_provider.return_value = provider
+            sm = StatusMonitor()
+            sm._buffers["t1"] = old_ready
+            sm._feed_screen_locked("t1", old_ready)
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.COMPLETED
+
+            provider.prepare_input_delivery()
+            sm.notify_input_sent("t1")
+            provider.mark_input_received()
+
+            live = (
+                "\x1b[H\x1b[2J"
+                "● PREVIOUS_RESPONSE\r\n"
+                "✢ Thinking… (1s · ↓ 12 tokens)\r\n" + f"{box}\r\n❯ \r\n{box}\r\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+            )
+            sm._buffers["t1"] += live
+            sm._feed_screen_locked("t1", live)
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+            assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+            # Claude clears the spinner row before painting the new response.
+            # The composited screen now looks exactly like the old completed
+            # frame, but the raw stream has no new response delta yet.
+            spinner_erase = "\x1b[2;1H\x1b[2K"
+            sm._buffers["t1"] += spinner_erase
+            sm._feed_screen_locked("t1", spinner_erase)
+            sm._bursting["t1"] = False
+            assert (
+                provider.get_status_from_screen(list(sm._screens["t1"][0].display))
+                == TerminalStatus.COMPLETED
+            )
+            assert provider.confirms_current_turn_completion(sm._buffers["t1"]) is False
+
+            # Quiescence path.
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.PROCESSING
+            assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+            # Poll-refresh path while the stream is already quiescent.
+            assert sm.get_status("t1") == TerminalStatus.PROCESSING
+            assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+            final = (
+                "\x1b[H\x1b[2J"
+                "● CURRENT_RESPONSE\r\n"
+                "✻ Worked for 2s\r\n" + f"{box}\r\n❯ \r\n{box}\r\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+            )
+            sm._buffers["t1"] += final
+            sm._feed_screen_locked("t1", final)
+            assert provider.confirms_current_turn_completion(sm._buffers["t1"]) is True
+            assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.COMPLETED
+            assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
     def test_stale_async_detection_cannot_consume_new_generation(self):
         sm = StatusMonitor()
         sm._last_status["t1"] = TerminalStatus.COMPLETED

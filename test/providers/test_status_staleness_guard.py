@@ -28,6 +28,14 @@ class TestContentBasedStalenessGuard:
     """Test the content-based staleness check on the buffer path."""
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_completion_confirmation_is_unsupported_before_dispatch(self, mock_backend):
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+
+        assert provider.confirms_current_turn_completion("any ready frame") is None
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_stale_buffer_after_send_input_returns_processing(self, mock_backend):
         """Right after mark_input_received, unchanged buffer → PROCESSING."""
         mock_backend.get_native_status.return_value = None

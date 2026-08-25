@@ -1480,10 +1480,12 @@ class ClaudeCodeProvider(BaseProvider):
         self._input_generation += 1
         super().mark_input_received()
 
-    def confirms_current_turn_completion(self, output: str) -> bool:
+    def confirms_current_turn_completion(self, output: str) -> Optional[bool]:
         """Authenticate a fast completed frame against the pre-send baseline."""
 
-        if self._input_generation <= 0 or not output:
+        if self._input_generation <= 0:
+            return None
+        if not output:
             return False
         return self.get_status(output) == TerminalStatus.COMPLETED
 

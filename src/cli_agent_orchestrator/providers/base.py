@@ -282,15 +282,15 @@ class BaseProvider(ABC):
         :meth:`mark_input_received` runs after a successful send.
         """
 
-    def confirms_current_turn_completion(self, output: str) -> bool:
+    def confirms_current_turn_completion(self, output: str) -> Optional[bool]:
         """Return whether ``output`` proves completion of the just-sent turn.
 
-        The conservative default is False.  A provider may opt in only when it
-        has a pre-send baseline that distinguishes a new response from a stale
-        repaint of the previous ready screen.
+        ``None`` means that the provider does not support this check or has no
+        dispatch baseline yet. ``False`` explicitly rejects the visible ready
+        frame as completion of the current turn, while ``True`` confirms it.
         """
 
-        return False
+        return None
 
     def current_turn_processing_sample(
         self, output: str

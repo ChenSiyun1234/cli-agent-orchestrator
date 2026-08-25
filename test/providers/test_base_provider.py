@@ -70,6 +70,7 @@ class TestBaseProvider:
         provider = ConcreteProvider("term-123", "session-1", "window-0")
 
         assert provider.get_status("some output") == TerminalStatus.IDLE
+        assert provider.confirms_current_turn_completion("some output") is None
         assert provider.extract_last_message_from_script("test") == "extracted message"
         assert provider.exit_cli() == "/exit"
         provider.cleanup()  # Should not raise
