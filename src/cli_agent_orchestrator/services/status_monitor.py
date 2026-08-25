@@ -733,11 +733,21 @@ class StatusMonitor:
         This bypasses the output event bus so historical scrollback is not
         duplicated in the append-only terminal log.  Future bytes still arrive
         through the reattached FIFO reader.
+
+        ``tmux capture-pane`` returns display rows separated by bare LF.  pyte
+        models a terminal with line-feed/new-line mode disabled, so feeding
+        that text verbatim advances rows without returning to column zero and
+        staircases the restored screen.  Subsequent cursor-addressed TUI
+        redraws can then leave stale processing chrome in the wrong rows even
+        after the real pane is idle.  Convert captured rows to terminal-style
+        CRLF before seeding, matching the stalled-pipe replay path.
         """
 
         self.reset_buffer(terminal_id)
         if history:
-            self._process_chunk(terminal_id, history)
+            normalized_history = history.replace("\r\n", "\n").replace("\r", "\n")
+            normalized_history = normalized_history.replace("\n", "\r\n")
+            self._process_chunk(terminal_id, normalized_history)
 
     def _detect_status(self, terminal_id: str, buffer: str) -> TerminalStatus:
         """Detect status: provider-specific patterns or UNKNOWN if no provider."""

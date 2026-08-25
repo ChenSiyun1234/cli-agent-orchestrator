@@ -146,6 +146,7 @@ class FifoManager:
         terminal_id: str,
         pane_probe: Optional[PaneProbe] = None,
         rearm: Optional[RearmPipe] = None,
+        restore_baseline: Optional[str] = None,
     ) -> None:
         """Create FIFO and start reader thread.
 
@@ -153,6 +154,24 @@ class FifoManager:
         (tmux) callers. When both are given, the terminal is enrolled in the
         liveness watchdog (issue #388). Callers that omit them (or backends
         without pipe-pane) get exactly the old behavior — no watchdog.
+
+        ``restore_baseline`` is supplied only by
+        ``restore_persisted_terminal_monitors`` for a durable tmux pane
+        reconnected after a ``cao-server`` restart. Such a pane was already
+        running before the restart, so an idle restored pane legitimately
+        forwards nothing new through the freshly-attached pipe — that is NOT
+        the never-started cold-start shape (harness-control#93). Left to the
+        cold-start path it would be re-armed a few times and then dropped from
+        the watchdog (``cold_start_give_up``), freezing status and leaving
+        inbox messages pending. When a baseline is given the terminal instead
+        seeds the ordinary divergence watchdog directly from that pre-attach
+        pane tail and the cold-start branch is made inapplicable
+        (``_registered_at`` left unset), all WITHOUT fabricating a FIFO
+        delivery (``_ever_delivered`` stays False) — a genuine post-restore
+        stall is then still caught by the normal two-strike divergence path.
+        Default (``None``) behavior is unchanged: fresh terminals keep the
+        cold-start seeding. Only meaningful together with
+        ``pane_probe``/``rearm``.
         """
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
@@ -177,10 +196,37 @@ class FifoManager:
             # Seed the liveness clock BEFORE pipe-pane starts so the first
             # watchdog check has a baseline; the reader bumps it on real data.
             now = time.monotonic()
-            self._last_data_at[terminal_id] = now
-            self._registered_at[terminal_id] = now
             self._ever_delivered[terminal_id] = False
+            if enroll and restore_baseline is not None:
+                # Restored durable pane (see the restore_baseline docstring):
+                # seed the divergence watchdog directly from the pre-attach
+                # pane tail and leave _registered_at unset so the cold-start
+                # branch is inapplicable — WITHOUT fabricating a FIFO delivery
+                # (_ever_delivered stays False above). This makes an idle
+                # restored pane survive instead of being dropped as a dead
+                # cold start, while a genuine post-restore stall is still
+                # caught by the ordinary two-strike divergence path.
+                #
+                # Crucially, last-data-at is seeded genuinely PRE-DELIVERY
+                # (0.0, strictly before the baseline's last_check_at ``now``)
+                # rather than to ``now`` itself. The watchdog reads
+                # ``last_data_at >= last_check_at`` as "the FIFO advanced";
+                # seeding both to the same ``now`` would make the VERY FIRST
+                # check misread that equality as a delivery and re-baseline to
+                # whatever the pane shows then — silently adopting a one-shot
+                # frame rendered in the capture->attach window (bytes the pipe
+                # never forwarded) as healthy instead of repairing it. 0.0
+                # means "nothing delivered yet", so the first check runs the
+                # ordinary missed-bytes divergence comparison; the reader
+                # thread overwrites it with a real monotonic time the instant
+                # genuine bytes flow.
+                self._last_data_at[terminal_id] = 0.0
+                self._liveness[terminal_id] = (restore_baseline, now, 0)
+            else:
+                self._last_data_at[terminal_id] = now
+                self._registered_at[terminal_id] = now
             if enroll:
+                assert pane_probe is not None and rearm is not None
                 self._pane_probe[terminal_id] = pane_probe
                 self._rearm[terminal_id] = rearm
             thread.start()
@@ -483,10 +529,15 @@ class FifoManager:
 
             # ---- cold-start check (harness-control#93) ----
             # `.get(..., True)` / `registered_at is None` default to "not a
-            # cold start": entries created via create_reader() always have
-            # both set, but tests that poke _pane_probe/_rearm/_last_data_at
-            # directly (bypassing create_reader) leave them absent, and must
-            # keep exercising only the pre-existing divergence path.
+            # cold start". Fresh-terminal entries created via create_reader()
+            # always have both set; a restored durable pane (create_reader
+            # with a restore_baseline) deliberately leaves _registered_at
+            # unset so this cold-start branch is inapplicable and only the
+            # divergence path runs — a restored idle pane forwards nothing yet
+            # is not a never-started pipe. Tests that poke
+            # _pane_probe/_rearm/_last_data_at directly (bypassing
+            # create_reader) likewise leave them absent and must keep
+            # exercising only the pre-existing divergence path.
             ever_delivered = self._ever_delivered.get(terminal_id, True)
             registered_at = self._registered_at.get(terminal_id)
             if (

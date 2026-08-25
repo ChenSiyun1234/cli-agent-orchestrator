@@ -223,10 +223,22 @@ def restore_persisted_terminal_monitors() -> Dict[str, int]:
             # A pane has exactly one pipe target.  Stop the stale pre-restart
             # writer first, then attach the new process's reader and target.
             backend.stop_pipe_pane(session_name, window_name)
+            # Capture the current pane tail BEFORE re-attaching the pipe: a
+            # restored durable pane was already running before the restart, so
+            # an idle restored pane forwards nothing new through the fresh pipe
+            # — which is not the never-started cold-start shape
+            # (harness-control#93). Seed the liveness watchdog's divergence
+            # baseline from this pre-attach tail so the restored terminal stays
+            # enrolled instead of being dropped as a dead cold start; a genuine
+            # post-restore stall is then still caught by the divergence path.
+            restore_baseline = backend.get_history(
+                session_name, window_name, tail_lines=PIPE_LIVENESS_TAIL_LINES
+            )
             fifo_manager.create_reader(
                 terminal_id,
                 pane_probe=_probe_pane,
                 rearm=_rearm_pipe,
+                restore_baseline=restore_baseline,
             )
             reader_started = True
             backend.pipe_pane(session_name, window_name, str(fifo_path))

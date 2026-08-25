@@ -1154,6 +1154,25 @@ class TestQuiescenceTimerCancel:
         sm._loop.call_soon_threadsafe.assert_not_called()
 
 
+class TestRestoredHistoryScreenSeed:
+    """A tmux capture-pane snapshot must render like the pane it came from."""
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_bare_lf_capture_rows_are_seeded_as_terminal_newlines(self, mock_pm):
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.get_status_from_screen.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+
+        sm.seed_terminal_history("restored", "alpha\nbeta\r\ngamma\rdelta")
+
+        screen = sm._screens["restored"][0]
+        nonblank = [line.rstrip() for line in screen.display if line.strip()]
+        assert nonblank[:4] == ["alpha", "beta", "gamma", "delta"]
+        assert sm.get_buffer("restored") == "alpha\r\nbeta\r\ngamma\r\ndelta"
+
+
 class TestRawDebounceArmedDetection:
     """Regression: raw debounce must detect PROCESSING on later chunks while armed."""
 

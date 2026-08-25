@@ -833,6 +833,153 @@ class TestColdStartStallDetection:
         assert rearm_calls == [True], "must wait out a fresh grace period before re-arming again"
 
 
+class TestRestoredPaneLiveness:
+    """restore_persisted_terminal_monitors reconnects a durable tmux pane after
+    a cao-server restart. That pane was already running before the restart, so
+    an idle restored pane legitimately forwards nothing new through the freshly
+    attached pipe — which is NOT the never-started cold-start shape
+    (harness-control#93). Left on the cold-start path an idle restored pane is
+    re-armed a few times and then dropped from the watchdog
+    (cold_start_give_up): the final reader/pipe remain, but future genuine
+    stalls are never repaired, so status freezes and inbox messages stay
+    pending. create_reader(restore_baseline=...) seeds the ordinary divergence
+    watchdog from the pre-attach pane tail and makes the cold-start branch
+    inapplicable WITHOUT fabricating a FIFO delivery.
+    """
+
+    def _manager(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
+        return FifoManager()
+
+    def test_restore_baseline_seeds_divergence_and_disables_cold_start(self, tmp_path, monkeypatch):
+        """create_reader with a restore_baseline seeds _liveness from the exact
+        pre-attach tail, leaves _registered_at unset (cold-start inapplicable),
+        does NOT fabricate a delivery (_ever_delivered stays False), and seeds
+        last_data_at genuinely PRE-DELIVERY: strictly before the baseline's
+        last_check_at timestamp so the first watchdog check cannot misread
+        timestamp equality as a FIFO delivery (the capture->attach race)."""
+        manager = self._manager(tmp_path, monkeypatch)
+        try:
+            manager.create_reader(
+                "term-restore",
+                pane_probe=lambda: "baseline pane tail",
+                rearm=lambda: None,
+                restore_baseline="baseline pane tail",
+            )
+            with manager._lock:
+                liveness_content, liveness_at, strikes = manager._liveness["term-restore"]
+                assert liveness_content == "baseline pane tail"
+                assert strikes == 0
+                # last_data_at must be STRICTLY less than the baseline
+                # timestamp — otherwise last_data_at >= last_check_at would
+                # read as "FIFO advanced" on the very first check.
+                assert manager._last_data_at["term-restore"] < liveness_at
+                assert "term-restore" not in manager._registered_at
+                assert manager._ever_delivered.get("term-restore") is False
+        finally:
+            manager.stop_reader("term-restore")
+            manager.stop_watchdog()
+
+    def test_static_restored_pane_survives_cold_start_limit_without_rearm(
+        self, tmp_path, monkeypatch
+    ):
+        """A static, nonempty restored pane (FIFO silent, pane never changes)
+        must NOT be dropped like a dead cold start: well past the cold-start
+        attempt budget it has zero re-arms and stays enrolled with exactly one
+        reader."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_COLD_START_GRACE_S", 0.0)
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS", 5)
+        manager = self._manager(tmp_path, monkeypatch)
+        rearm_calls: list = []
+        try:
+            manager.create_reader(
+                "term-restore",
+                pane_probe=lambda: "settled prompt",
+                rearm=lambda: rearm_calls.append(True),
+                restore_baseline="settled prompt",
+            )
+            # Drive the checks deterministically by hand instead of racing the
+            # background watchdog thread.
+            manager.stop_watchdog()
+
+            # Eight checks — comfortably past PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS.
+            for _ in range(8):
+                manager._check_pipe_liveness("term-restore")
+
+            assert rearm_calls == [], "a static restored pane must never be re-armed"
+            assert "term-restore" in manager._pane_probe, "must stay enrolled in the watchdog"
+            assert "term-restore" in manager._rearm
+            assert list(manager._readers) == ["term-restore"], "exactly one reader stays enrolled"
+        finally:
+            manager.stop_reader("term-restore")
+            manager.stop_watchdog()
+
+    def test_restored_pane_missed_frame_before_first_check_reaches_two_strike_repair(
+        self, tmp_path, monkeypatch
+    ):
+        """The capture->attach race: a one-shot frame renders in the window
+        between the pre-attach baseline capture and pipe attachment, so the
+        pane ALREADY diverges from the baseline before the very first watchdog
+        check and the FIFO never forwarded those bytes.
+
+        The first check must NOT mistake the seeded timestamp equality
+        (last_data_at == the baseline's last_check_at) for a FIFO delivery and
+        silently re-baseline to the missed frame as healthy. With last_data_at
+        seeded genuinely pre-delivery, the first check reads "FIFO has not
+        advanced" and the divergence path accumulates strikes normally: two
+        consecutive diverging checks re-arm EXACTLY once, publish EXACTLY one
+        CRLF-normalized replay of the live pane, and keep the terminal
+        enrolled (not dropped like a cold-start give-up)."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)  # production default
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_COLD_START_GRACE_S", 0.0)
+        published: list = []
+        monkeypatch.setattr(fr.bus, "publish", lambda topic, data: published.append((topic, data)))
+        manager = self._manager(tmp_path, monkeypatch)
+        # The pane already shows the missed frame (diverged from the pre-attach
+        # baseline "settled prompt") from the very first check. Multi-line so
+        # the CRLF normalization of the replay is exercised, not just equality.
+        missed_frame = "line0\nline1\nline2 (rendered in the capture->attach gap, never piped)"
+        pane = {"content": missed_frame}
+        rearm_calls: list = []
+        try:
+            manager.create_reader(
+                "term-restore",
+                pane_probe=lambda: pane["content"],
+                rearm=lambda: rearm_calls.append(True),
+                restore_baseline="settled prompt",
+            )
+            manager.stop_watchdog()  # drive checks by hand
+
+            # First check already diverges (missed frame) with the FIFO silent
+            # — this is strike 1, NOT a false "healthy" re-baseline.
+            manager._check_pipe_liveness("term-restore")
+            assert rearm_calls == [], "a single diverging check must not re-arm yet"
+            assert published == [], "no replay before the stall is confirmed"
+
+            # Still diverged, FIFO still silent -> strike 2 -> re-arm once.
+            manager._check_pipe_liveness("term-restore")
+            assert rearm_calls == [True], "the missed-frame stall must be re-armed once"
+
+            # EXACTLY one replay event, CRLF-normalized from the live pane.
+            assert published == [
+                ("terminal.term-restore.output", {"data": missed_frame.replace("\n", "\r\n")})
+            ]
+            # And the raw bare-LF form must NOT have been published.
+            assert (
+                "terminal.term-restore.output",
+                {"data": missed_frame},
+            ) not in published
+
+            # Re-armed exactly once and STILL enrolled — not dropped like a
+            # cold-start give-up would.
+            assert "term-restore" in manager._pane_probe
+            assert "term-restore" in manager._rearm
+            assert "term-restore" in manager._readers
+        finally:
+            manager.stop_reader("term-restore")
+            manager.stop_watchdog()
+
+
 class TestConcurrencyRaces:
     """Round-3 Copilot review on #397: two lock-scope gaps in code the round-2
     review had already touched.

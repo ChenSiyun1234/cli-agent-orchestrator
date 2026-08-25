@@ -1,10 +1,11 @@
 """Full tests for terminal service."""
 
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+from cli_agent_orchestrator.constants import PIPE_LIVENESS_TAIL_LINES
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -1390,7 +1391,14 @@ class TestRestorePersistedTerminalMonitors:
     ):
         backend.supports_event_inbox.return_value = False
         backend.session_exists.return_value = True
-        backend.get_history.side_effect = ["probe", "settled live history"]
+        # get_history is called three times, in order: the window-existence
+        # probe (tail_lines=1), the pre-attach liveness baseline capture
+        # (tail_lines=PIPE_LIVENESS_TAIL_LINES), then the 500-line status seed.
+        backend.get_history.side_effect = [
+            "probe",
+            "restore tail baseline",
+            "settled live history",
+        ]
         list_terminals.return_value = [
             {
                 "id": "abc12345",
@@ -1404,8 +1412,18 @@ class TestRestorePersistedTerminalMonitors:
         assert result == {"restored": 1, "skipped": 0, "failed": 0}
         providers.get_provider.assert_called_once_with("abc12345")
         backend.stop_pipe_pane.assert_called_once_with("cao-session", "worker-abcd")
+        # The restored reader is seeded with the EXACT pre-attach pane tail so
+        # the liveness watchdog runs the ordinary divergence path instead of
+        # the cold-start path (which would drop an idle restored pane).
         fifos.create_reader.assert_called_once()
+        _, create_kwargs = fifos.create_reader.call_args
+        assert create_kwargs["restore_baseline"] == "restore tail baseline"
+        assert backend.get_history.call_args_list[1] == call(
+            "cao-session", "worker-abcd", tail_lines=PIPE_LIVENESS_TAIL_LINES
+        )
         backend.pipe_pane.assert_called_once()
+        # Status is primed by a direct seed, never by replaying scrollback back
+        # through the event bus — no duplicate event replay on restore.
         monitor.seed_terminal_history.assert_called_once_with("abc12345", "settled live history")
         backend.send_keys.assert_not_called()
         backend.send_special_key.assert_not_called()
