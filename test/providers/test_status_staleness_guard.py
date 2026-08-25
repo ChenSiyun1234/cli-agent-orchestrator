@@ -27,6 +27,40 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 class TestContentBasedStalenessGuard:
     """Test the content-based staleness check on the buffer path."""
 
+    def test_marker_only_repaint_is_not_a_snapshot_response(self):
+        """A standalone TUI ``●`` must not absorb the next spinner line."""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        repaint = (
+            "● \n\n"
+            "✽ Perusing… (1m 26s · ↓ 4.3k tokens)\n"
+            "⎿ Tip: use /btw for a side question\n"
+            "❯ "
+        )
+
+        assert provider._extract_last_response_text(repaint) is None
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_marker_only_repaint_cannot_hijack_real_snapshot_response(self, mock_backend):
+        """Only same-line response markers contribute to the dispatch baseline."""
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        repaint = (
+            "● Real answer\n"
+            "● \n\n"
+            "✽ Perusing… (1m 26s · ↓ 4.3k tokens)\n"
+            "⎿ Tip: use /btw for a side question\n"
+            "❯ "
+        )
+        mock_backend.get_history.return_value = repaint
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+
+        provider.mark_input_received()
+
+        assert provider._snapshot_last_response is not None
+        assert provider._snapshot_last_response.startswith("Real answer\n")
+        assert not provider._snapshot_last_response.startswith("✽ Perusing…")
+        assert provider._snapshot_response_count == 1
+
     @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_completion_confirmation_is_unsupported_before_dispatch(self, mock_backend):
         mock_backend.get_native_status.return_value = None

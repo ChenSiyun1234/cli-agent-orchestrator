@@ -103,6 +103,13 @@ EXTRACTION_RESPONSE_PATTERN = re.compile(
     r"^[ \t]*(?:\x1b\[[0-9;]*m)*[⏺●](?:\x1b\[[0-9;]*m)*(?![ \t]*" + _EFFORT_FOOTER_TAIL + r")\s+",
     re.MULTILINE,
 )
+# Snapshot staleness tracking has a deliberately stricter response marker than
+# message extraction.  Claude's TUI can repaint a marker-only ``●`` row before
+# drawing a spinner or footer on the following line.  ``\s+`` crosses that line
+# boundary and would therefore treat the spinner/footer as the prior response,
+# making a genuinely completed turn look identical to its pre-send baseline.
+# Require response text to begin on the same physical line instead.
+SNAPSHOT_RESPONSE_PATTERN = re.compile(r"^[ \t]*[⏺●][ \t]+(?=\S)", re.MULTILINE)
 # Own-line effort-footer, e.g. "● high · /effort" (glyph + the tail shape
 # above). Standalone (not a lookahead) so get_status()'s box-walk can skip past
 # this exact chrome line while searching for a live spinner (GH #459). Shares
@@ -389,7 +396,7 @@ class ClaudeCodeProvider(BaseProvider):
     def _extract_last_response_text(output: str) -> Optional[str]:
         """Extract the text of the last response marker (⏺/●) in *output*, ANSI-stripped."""
         clean = ClaudeCodeProvider._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
-        matches = list(re.finditer(r"[⏺●]\s+", clean))
+        matches = list(SNAPSHOT_RESPONSE_PATTERN.finditer(clean))
         if not matches:
             return None
         last = matches[-1]
@@ -1185,7 +1192,7 @@ class ClaudeCodeProvider(BaseProvider):
                 current_response = self._extract_last_response_text(output)
                 if current_response == self._snapshot_last_response:
                     clean = self._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
-                    current_count = len(list(re.finditer(r"[⏺●]\s+", clean)))
+                    current_count = len(list(SNAPSHOT_RESPONSE_PATTERN.finditer(clean)))
                     if current_count == self._snapshot_response_count:
                         return TerminalStatus.PROCESSING
             return TerminalStatus.COMPLETED
@@ -1456,7 +1463,7 @@ class ClaudeCodeProvider(BaseProvider):
         self._snapshot_last_response = self._extract_last_response_text(output)
         self._snapshot_had_quota_banner = _has_account_quota_banner(strip_terminal_escapes(output))
         clean = self._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
-        self._snapshot_response_count = len(list(re.finditer(r"[⏺●]\s+", clean)))
+        self._snapshot_response_count = len(list(SNAPSHOT_RESPONSE_PATTERN.finditer(clean)))
 
     def prepare_input_delivery(self) -> None:
         """Snapshot the previous turn before bracketed paste can finish quickly."""
