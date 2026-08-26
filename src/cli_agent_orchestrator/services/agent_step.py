@@ -23,6 +23,7 @@ retry policy (FR-5.3); the HTTP handler maps it to an ``HTTPException``.
 
 import asyncio
 import logging
+import re
 import time
 from typing import Callable, Optional
 
@@ -58,6 +59,16 @@ DEFAULT_READY_TIMEOUT = 120.0
 _COMPLETION_POLL_INTERVAL = 1.0
 _IDLE_STABLE_POLLS = 3
 
+# A provider TUI can expose its idle prompt while it is still streaming the
+# final answer. Status-based completion is therefore not sufficient for
+# workflow prompts that explicitly require a ``CAO_*_END`` envelope: tearing
+# down immediately can inject the provider's exit command into the answer and
+# truncate the envelope. Poll the extracted last message until the required end
+# marker is present. The caller's explicit timeout, when supplied, remains the
+# only time boundary; the default ``timeout=None`` adds no hidden worker limit.
+_WORKFLOW_ENVELOPE_RE = re.compile(r"\b(CAO_[A-Z0-9_]+)_BEGIN\b")
+_WORKFLOW_OUTPUT_DRAIN_POLL_INTERVAL = 0.25
+
 # Identity env keys that mark a workflow-owned step. When BOTH are present in a
 # step's ``env_vars``, the worker's structured ``workflow_return`` (a
 # ``StepOutputRecord`` keyed by these) is an authoritative completion signal:
@@ -72,6 +83,78 @@ _WORKFLOW_STEP_ID_ENV = "CAO_WORKFLOW_STEP_ID"
 # ready terminal and interleave prompts.  Entries are intentionally retained
 # for the server lifetime; terminal IDs are bounded, short-lived records.
 _REUSED_TERMINAL_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _required_workflow_end_marker(prompt: str) -> Optional[str]:
+    """Return the first explicit CAO envelope end marker required by ``prompt``.
+
+    Workflow prompts put their own output contract before task/report content,
+    so the first complete ``CAO_*_BEGIN`` / ``CAO_*_END`` pair is authoritative.
+    Ordinary prompts, including implementation reports with no envelope, return
+    ``None`` and retain the one-shot extraction path.
+    """
+
+    for match in _WORKFLOW_ENVELOPE_RE.finditer(prompt):
+        end_marker = match.group(1) + "_END"
+        if end_marker in prompt:
+            return end_marker
+    return None
+
+
+async def _extract_completed_output(
+    terminal_id: str,
+    prompt: str,
+    cancel_event: Optional[asyncio.Event],
+    timeout: Optional[float],
+    *,
+    workflow_owned: bool,
+) -> str:
+    """Extract a settled step without truncating an explicit workflow envelope."""
+
+    end_marker = _required_workflow_end_marker(prompt) if workflow_owned else None
+    if end_marker is None:
+        return await asyncio.to_thread(terminal_service.get_output, terminal_id, OutputMode.LAST)
+
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    last_message: Optional[str] = None
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise StepCancelledError(terminal_id=terminal_id)
+        try:
+            last_message = await asyncio.to_thread(
+                terminal_service.get_output, terminal_id, OutputMode.LAST
+            )
+        except ValueError:
+            # Providers may refuse LAST extraction until a response boundary is
+            # fully rendered. While draining, this is ordinary partial output,
+            # not yet a step failure.
+            last_message = None
+        if last_message is not None and end_marker in last_message:
+            return last_message
+        if status_monitor.get_status(terminal_id) == TerminalStatus.ERROR:
+            raise StepExecutionError(
+                f"terminal {terminal_id} reached ERROR while draining output",
+                kind=_terminal_error_kind(terminal_id),
+                terminal_id=terminal_id,
+            )
+        if deadline is not None and time.monotonic() >= deadline:
+            raise StepExecutionError(
+                f"terminal {terminal_id} completed without required output marker "
+                f"{end_marker} within the explicit {timeout}s timeout",
+                kind="timeout",
+                terminal_id=terminal_id,
+            )
+        if cancel_event is not None:
+            try:
+                await asyncio.wait_for(
+                    cancel_event.wait(), timeout=_WORKFLOW_OUTPUT_DRAIN_POLL_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                pass
+            else:
+                raise StepCancelledError(terminal_id=terminal_id)
+        else:
+            await asyncio.sleep(_WORKFLOW_OUTPUT_DRAIN_POLL_INTERVAL)
 
 
 async def _validate_reused_terminal(
@@ -397,8 +480,12 @@ async def _execute_terminal_step(
         raise
 
     try:
-        last_message = await asyncio.to_thread(
-            terminal_service.get_output, terminal_id, OutputMode.LAST
+        last_message = await _extract_completed_output(
+            terminal_id,
+            prompt,
+            cancel_event,
+            timeout,
+            workflow_owned=(settle_run_id is not None and settle_step_id is not None),
         )
     except BaseException:
         if teardown and created_here:

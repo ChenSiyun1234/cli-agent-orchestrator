@@ -105,6 +105,42 @@ class TestHappyPath:
         m_exit.assert_called_once_with("abc12345")
         m_delete.assert_called_once_with("abc12345", registry=None)
 
+    def test_workflow_envelope_drains_until_end_marker_before_teardown(self):
+        """A stale COMPLETED viewport must not let teardown truncate a CAO envelope."""
+
+        partial = "CAO_PLAN_BEGIN\n1. still streaming"
+        complete = partial + "\n2. finished\nCAO_PLAN_END"
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=partial
+        )
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output as m_out,
+            exit_cli as m_exit,
+            wait,
+            status,
+            patch(f"{_MODULE}.asyncio.sleep", new=AsyncMock()),
+        ):
+            m_out.side_effect = [partial, partial, complete]
+            result = asyncio.run(
+                run_agent_step(
+                    "kiro_cli",
+                    "developer",
+                    ("Return only between literal lines CAO_PLAN_BEGIN and " "CAO_PLAN_END."),
+                    env_vars={
+                        "CAO_WORKFLOW_RUN_ID": "run-1",
+                        "CAO_WORKFLOW_STEP_ID": "plan-1",
+                    },
+                )
+            )
+
+        assert result.last_message == complete
+        assert m_out.call_count == 3
+        m_exit.assert_called_once_with("abc12345")
+        m_delete.assert_called_once_with("abc12345", registry=None)
+
     def test_teardown_false_skips_delete(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with create, send, delete as m_delete, get_output, exit_cli as m_exit, wait, status:
