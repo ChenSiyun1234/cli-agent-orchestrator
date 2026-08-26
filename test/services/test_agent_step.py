@@ -976,3 +976,261 @@ class TestOutputExtractionTeardown:
         m_out.assert_called_once_with("reuse99", OutputMode.LAST)
         m_delete.assert_not_called()
         m_exit.assert_not_called()
+
+
+class TestWorkflowStructuredReturnSettles:
+    """A workflow-owned step settles from its own fresh structured ``workflow_return``
+    even while the provider viewport is still PROCESSING (the retained root cause of
+    the stuck run), while a stale/replayed pre-existing record cannot complete a new
+    attempt and cancellation/terminal-error stay fail-closed and win the race.
+    """
+
+    @staticmethod
+    def _record(run_id="r1", step_id="s1", *, validated=True):
+        from cli_agent_orchestrator.models.workflow import StepOutputRecord, StepState
+
+        return StepOutputRecord(
+            run_id=run_id,
+            step_id=step_id,
+            output={"answer": 42},
+            validated=validated,
+            errors=[] if validated else ["output failed schema validation"],
+            state=StepState.COMPLETED if validated else StepState.COMPLETED_UNVALIDATED,
+        )
+
+    def _fresh_store(self, seed=None):
+        from cli_agent_orchestrator.services.step_output_store import StepOutputStore
+
+        store = StepOutputStore()
+        if seed is not None:
+            store.put(seed.run_id, seed.step_id, seed)
+        return store
+
+    def test_processing_plus_fresh_validated_return_settles(self):
+        """PROCESSING viewport + a freshly posted validated record -> wait returns
+        (no COMPLETED marker, no IDLE, no timeout needed)."""
+        from cli_agent_orchestrator.services.agent_step import _wait_for_completion
+
+        rec = self._record(validated=True)
+        store = self._fresh_store(seed=rec)  # posted by this attempt's worker
+        with (
+            patch(f"{_MODULE}.step_output_store", store),
+            patch(
+                f"{_MODULE}.status_monitor.get_status",
+                return_value=TerminalStatus.PROCESSING,  # never flips
+            ),
+        ):
+            # settle_baseline=None: the record is FRESH relative to send time.
+            asyncio.run(
+                _wait_for_completion(
+                    "term-wf",
+                    timeout=None,
+                    settle_run_id="r1",
+                    settle_step_id="s1",
+                    settle_baseline=None,
+                )
+            )  # returns without raising -> settled
+
+    def test_processing_plus_fresh_invalid_return_settles(self):
+        """A schema-INVALID structured return also ends the wait (downstream maps it
+        to COMPLETED_UNVALIDATED); it must not hang waiting for a viewport signal."""
+        from cli_agent_orchestrator.services.agent_step import _wait_for_completion
+
+        rec = self._record(validated=False)
+        store = self._fresh_store(seed=rec)
+        with (
+            patch(f"{_MODULE}.step_output_store", store),
+            patch(
+                f"{_MODULE}.status_monitor.get_status",
+                return_value=TerminalStatus.PROCESSING,
+            ),
+        ):
+            asyncio.run(
+                _wait_for_completion(
+                    "term-wf",
+                    timeout=None,
+                    settle_run_id="r1",
+                    settle_step_id="s1",
+                    settle_baseline=None,
+                )
+            )  # invalid record still settles the wait
+
+    def test_no_return_retains_ordinary_status_waiting(self):
+        """With no structured return posted, a PROCESSING terminal still times out
+        on the ordinary status loop — the settlement path adds no early return."""
+        from cli_agent_orchestrator.services.agent_step import (
+            StepExecutionError,
+            _wait_for_completion,
+        )
+
+        store = self._fresh_store()  # empty
+        with (
+            patch(f"{_MODULE}.step_output_store", store),
+            patch(
+                f"{_MODULE}.status_monitor.get_status",
+                return_value=TerminalStatus.PROCESSING,
+            ),
+        ):
+            with pytest.raises(StepExecutionError, match="did not complete") as exc:
+                asyncio.run(
+                    _wait_for_completion(
+                        "term-wf",
+                        timeout=0,  # deadline on the first pass
+                        settle_run_id="r1",
+                        settle_step_id="s1",
+                        settle_baseline=None,
+                    )
+                )
+        assert exc.value.kind == "timeout"
+
+    def test_stale_pre_existing_return_does_not_settle(self):
+        """A record already present at send time (the baseline) is NOT fresh: it
+        must not complete the new attempt before that attempt's worker posts."""
+        from cli_agent_orchestrator.services.agent_step import (
+            StepExecutionError,
+            _wait_for_completion,
+        )
+
+        stale = self._record(validated=True)
+        store = self._fresh_store(seed=stale)  # pre-existing from a prior attempt
+        with (
+            patch(f"{_MODULE}.step_output_store", store),
+            patch(
+                f"{_MODULE}.status_monitor.get_status",
+                return_value=TerminalStatus.PROCESSING,
+            ),
+        ):
+            with pytest.raises(StepExecutionError, match="did not complete") as exc:
+                asyncio.run(
+                    _wait_for_completion(
+                        "term-wf",
+                        timeout=0,
+                        settle_run_id="r1",
+                        settle_step_id="s1",
+                        settle_baseline=stale,  # baseline IS the stale record
+                    )
+                )
+        assert exc.value.kind == "timeout"
+
+    def test_cancellation_wins_race_against_fresh_return(self):
+        """A set cancel_event is checked at the loop top, before the store: an
+        in-flight cancel wins even when a fresh return is already posted."""
+        from cli_agent_orchestrator.services.agent_step import (
+            StepCancelledError,
+            _wait_for_completion,
+        )
+
+        rec = self._record(validated=True)
+        store = self._fresh_store(seed=rec)
+
+        async def _run():
+            ev = asyncio.Event()
+            ev.set()
+            with (
+                patch(f"{_MODULE}.step_output_store", store),
+                patch(
+                    f"{_MODULE}.status_monitor.get_status",
+                    return_value=TerminalStatus.PROCESSING,
+                ),
+            ):
+                await _wait_for_completion(
+                    "term-wf",
+                    timeout=None,
+                    cancel_event=ev,
+                    settle_run_id="r1",
+                    settle_step_id="s1",
+                    settle_baseline=None,
+                )
+
+        with pytest.raises(StepCancelledError) as exc:
+            asyncio.run(_run())
+        assert exc.value.terminal_id == "term-wf"
+
+    def test_terminal_error_wins_race_against_fresh_return(self):
+        """An ERROR viewport is checked before the store: a crashed worker stays
+        fail-closed (kind='error') even when a fresh return is present."""
+        from cli_agent_orchestrator.services.agent_step import (
+            StepExecutionError,
+            _wait_for_completion,
+        )
+
+        rec = self._record(validated=True)
+        store = self._fresh_store(seed=rec)
+        with (
+            patch(f"{_MODULE}.step_output_store", store),
+            patch(
+                f"{_MODULE}.status_monitor.get_status",
+                return_value=TerminalStatus.ERROR,
+            ),
+        ):
+            with pytest.raises(StepExecutionError, match="ERROR status") as exc:
+                asyncio.run(
+                    _wait_for_completion(
+                        "term-wf",
+                        timeout=None,
+                        settle_run_id="r1",
+                        settle_step_id="s1",
+                        settle_baseline=None,
+                    )
+                )
+        assert exc.value.kind == "error"
+
+    def test_ordinary_non_workflow_step_never_consults_store(self):
+        """A step with no workflow identity pair (settle_step_id=None) must not read
+        the store at all — its completion stays purely status-based."""
+        from cli_agent_orchestrator.services.agent_step import (
+            StepExecutionError,
+            _wait_for_completion,
+        )
+
+        store = MagicMock()  # any store access would be a regression
+        with (
+            patch(f"{_MODULE}.step_output_store", store),
+            patch(
+                f"{_MODULE}.status_monitor.get_status",
+                return_value=TerminalStatus.PROCESSING,
+            ),
+        ):
+            with pytest.raises(StepExecutionError, match="did not complete"):
+                asyncio.run(_wait_for_completion("term-plain", timeout=0))
+        store.get.assert_not_called()
+
+    def test_run_agent_step_threads_workflow_env_to_settlement(self):
+        """End-to-end wiring: env_vars carrying both identity keys let run_agent_step
+        settle from a return posted after send, while the viewport stays PROCESSING."""
+        rec = self._record(validated=True)
+        store = self._fresh_store()  # empty at send time -> baseline is None
+
+        def _send(_terminal_id, _prompt):
+            # The worker posts its structured return during the step (after send).
+            store.put(rec.run_id, rec.step_id, rec)
+            return True
+
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.PROCESSING,  # viewport never flips
+        )
+        with (
+            create,
+            send,  # replaced below by the posting side_effect
+            delete,
+            get_output as m_out,
+            exit_cli,
+            wait,
+            status,
+            patch(f"{_MODULE}.step_output_store", store),
+            patch(f"{_MODULE}.terminal_service.send_input", side_effect=_send),
+        ):
+            result = asyncio.run(
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "do the task",
+                    env_vars={
+                        "CAO_WORKFLOW_RUN_ID": "r1",
+                        "CAO_WORKFLOW_STEP_ID": "s1",
+                    },
+                )
+            )
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == "the answer"
+        m_out.assert_called_once_with("abc12345", OutputMode.LAST)

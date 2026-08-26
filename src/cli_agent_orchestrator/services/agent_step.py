@@ -29,10 +29,12 @@ from typing import Callable, Optional
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
+from cli_agent_orchestrator.models.workflow import StepOutputRecord
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.step_output_store import step_output_store
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.utils.terminal import wait_until_status
 
@@ -55,6 +57,15 @@ DEFAULT_READY_TIMEOUT = 120.0
 # IDLE reads required before a post-input IDLE is accepted as "done" (issue #409a).
 _COMPLETION_POLL_INTERVAL = 1.0
 _IDLE_STABLE_POLLS = 3
+
+# Identity env keys that mark a workflow-owned step. When BOTH are present in a
+# step's ``env_vars``, the worker's structured ``workflow_return`` (a
+# ``StepOutputRecord`` keyed by these) is an authoritative completion signal:
+# the wait settles the instant a FRESH record is posted, even if the provider
+# viewport is still PROCESSING (the retained root cause of the stuck run). Ordinary
+# handoff / non-workflow steps carry neither key and are unaffected.
+_WORKFLOW_RUN_ID_ENV = "CAO_WORKFLOW_RUN_ID"
+_WORKFLOW_STEP_ID_ENV = "CAO_WORKFLOW_STEP_ID"
 
 # A reused process can execute only one step at a time.  The lock covers
 # validation, send, wait, and extraction so two callers cannot both observe a
@@ -208,11 +219,31 @@ async def _wait_for_completion(
     terminal_id: str,
     timeout: Optional[float],
     cancel_event: Optional["asyncio.Event"] = None,
+    *,
+    settle_run_id: Optional[str] = None,
+    settle_step_id: Optional[str] = None,
+    settle_baseline: Optional[StepOutputRecord] = None,
 ) -> None:
     """Wait for a post-input step to settle, polling ``status_monitor`` (issue #409).
 
     Called strictly AFTER the prompt has been sent, so IDLE here can never be the
     pre-input readiness IDLE the caller already waited past.
+
+    Workflow-owned settlement: when ``settle_run_id`` and ``settle_step_id`` are
+    both set (the step carries the workflow identity env pair), the worker's own
+    structured ``workflow_return`` — a ``StepOutputRecord`` posted to
+    ``step_output_store`` under that ``(run_id, step_id)`` — is an authoritative
+    completion signal. The wait returns the instant such a record appears, EVEN IF
+    the provider viewport is still ``PROCESSING`` (the retained root cause: a
+    finished worker whose terminal status never flips left the whole run wedged
+    with no task timeout). Freshness is attempt-local: ``settle_baseline`` is the
+    exact record present at send time (or ``None``), and only a record DISTINCT
+    from it counts — so a stale pre-existing / replayed record cannot complete a
+    new attempt before its own worker posts. Both a validated and a schema-invalid
+    return end the wait (the engine maps invalid to ``COMPLETED_UNVALIDATED``). The
+    store check runs AFTER the cancel and ERROR guards, so cancellation and a
+    terminal error stay fail-closed and win the race. When the pair is absent, or
+    no record is ever posted, waiting is exactly the ordinary status-based loop.
 
     Completion signals (issue #409a):
 
@@ -252,6 +283,24 @@ async def _wait_for_completion(
                 kind=_terminal_error_kind(terminal_id),
                 terminal_id=terminal_id,
             )
+        # Workflow-owned settlement: a FRESH structured return for this step is a
+        # definitive done marker regardless of viewport status. Checked AFTER the
+        # cancel (loop top) and ERROR guards so both stay fail-closed and win the
+        # race; only a record distinct from the pre-send snapshot settles, so a
+        # stale/replayed pre-existing record cannot finish this attempt.
+        if settle_run_id is not None and settle_step_id is not None:
+            posted = step_output_store.get(settle_run_id, settle_step_id)
+            if posted is not None and posted is not settle_baseline:
+                logger.info(
+                    "workflow step on terminal %s settled from its structured "
+                    "return (run=%s step=%s, validated=%s) — viewport status was %s",
+                    terminal_id,
+                    settle_run_id,
+                    settle_step_id,
+                    posted.validated,
+                    current,
+                )
+                return
         # send_input arms the terminal before dispatch. Until PROCESSING has
         # been observed, a cached COMPLETED marker belongs to the prior turn
         # and must not finish this step immediately.
@@ -316,13 +365,32 @@ async def _execute_terminal_step(
     created_here: bool,
     teardown: bool,
     registry: Optional[PluginRegistry],
+    settle_run_id: Optional[str] = None,
+    settle_step_id: Optional[str] = None,
 ) -> AgentStepResult:
     """Send, await, extract, and conditionally tear down one claimed terminal."""
+
+    # Attempt-local freshness snapshot for workflow-owned settlement: capture the
+    # record already present for this step (if any) BEFORE dispatch, so only a
+    # record posted by THIS attempt's worker settles the wait. A stale pre-existing
+    # record is this exact object and is rejected by identity in _wait_for_completion.
+    settle_baseline = (
+        step_output_store.get(settle_run_id, settle_step_id)
+        if settle_run_id is not None and settle_step_id is not None
+        else None
+    )
 
     await asyncio.to_thread(terminal_service.send_input, terminal_id, prompt)
 
     try:
-        await _wait_for_completion(terminal_id, timeout, cancel_event)
+        await _wait_for_completion(
+            terminal_id,
+            timeout,
+            cancel_event,
+            settle_run_id=settle_run_id,
+            settle_step_id=settle_step_id,
+            settle_baseline=settle_baseline,
+        )
     except StepCancelledError:
         if created_here:
             await _best_effort_teardown(terminal_id, registry)
@@ -480,6 +548,17 @@ async def run_agent_step(
     created_here = reuse_terminal_id is None
     terminal_id = reuse_terminal_id
 
+    # A workflow-owned step carries BOTH identity keys in env_vars; its structured
+    # workflow_return then settles the completion wait directly (see
+    # _wait_for_completion). Both keys are required to form the store key — a step
+    # id without a run id cannot address the store, so it disables settlement.
+    # Ordinary handoff / non-workflow steps pass neither and are unchanged.
+    _env = env_vars or {}
+    settle_run_id = _env.get(_WORKFLOW_RUN_ID_ENV)
+    settle_step_id = _env.get(_WORKFLOW_STEP_ID_ENV)
+    if settle_run_id is None:
+        settle_step_id = None
+
     if created_here:
         # Inherit working directory from supervisor when not explicitly set.
         # Without this, a handoff worker starts in the cao-server process CWD
@@ -599,6 +678,8 @@ async def run_agent_step(
                 created_here=False,
                 teardown=False,
                 registry=registry,
+                settle_run_id=settle_run_id,
+                settle_step_id=settle_step_id,
             )
 
     assert terminal_id is not None  # for type-checkers: set in both branches
@@ -610,6 +691,8 @@ async def run_agent_step(
         created_here=True,
         teardown=teardown,
         registry=registry,
+        settle_run_id=settle_run_id,
+        settle_step_id=settle_step_id,
     )
 
 
