@@ -377,12 +377,11 @@ def test_cancel_composes_live_script(portal_client, monkeypatch, tmp_path):
 
 
 # ===========================================================================
-# T5 (AA-5, IP-2): cancel works DETACHED. After the registry is cleared, the run
-# is cancelled from the journal alone via links.cancel -- no live connection, no
-# registry entry. Cancel is issued FIRST (before any rebuilding GET) so the
-# journal-fallback arm handles it, exactly as a real restarted server would.
+# T5 (AA-5, IP-2): cancel fails closed when this process does not own the live
+# run. A journal row proves durable state, not control delivery. This models a
+# restarted or second API process sharing the journal with the actual owner.
 # ===========================================================================
-def test_detached_cancel_via_link_yaml(portal_client, monkeypatch):
+def test_detached_cancel_requires_live_owner_yaml(portal_client, monkeypatch):
     _point_spec(monkeypatch, _YAML_SPEC)
     monkeypatch.setattr(workflow_service, "run_agent_step", _long_yaml_leaf())
 
@@ -392,13 +391,20 @@ def test_detached_cancel_via_link_yaml(portal_client, monkeypatch):
     workflow_service.run_registry.clear()  # submitter gone / restart-ish
 
     cancelled = portal_client.post(body["links"]["cancel"])
-    assert cancelled.status_code == 200, "AA-5 BROKEN: cancel link unresolvable when detached"
+    assert cancelled.status_code == 409
+    assert "cancellation was not delivered" in cancelled.json()["detail"]
+    assert workflow_journal.get_run("int-dcancel").state == "running"
 
-    status = portal_client.get("/workflows/runs/int-dcancel")
-    assert status.json()["state"] == "cancelled"
-    result = portal_client.get("/workflows/runs/int-dcancel/result")
-    assert result.status_code == 200
-    assert result.json()["state"] == "cancelled"
+    # A cold/foreign GET remains journal-authoritative for observation, but must
+    # not promote the reconstructed RUNNING row into a fake live owner.
+    observed = portal_client.get("/workflows/runs/int-dcancel")
+    assert observed.status_code == 200
+    assert observed.json()["state"] == "running"
+    assert "int-dcancel" not in workflow_service.run_registry
+
+    cancelled_after_get = portal_client.post(body["links"]["cancel"])
+    assert cancelled_after_get.status_code == 409
+    assert workflow_journal.get_run("int-dcancel").state == "running"
 
 
 # ===========================================================================

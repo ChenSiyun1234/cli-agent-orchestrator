@@ -5238,22 +5238,18 @@ async def cancel_workflow_run_endpoint(
     """Cooperatively cancel a running workflow (FR-5.4, U5 A5).
 
     Tier dispatch reads the LIVE ``run_registry`` record FIRST (BR-15) —
-    ``getattr(record, "tier", "yaml")`` — because cancel's async/sync split is
-    a property of which function to call on a live process. If absent
-    (crash remnant or already-finalized), falls back to the durable journal
-    (BR-16): absent row -> 404; terminal state -> 409; otherwise the row is a
-    JOURNALED-BUT-NOT-LIVE run — no in-memory record for ``cancel_run`` (which
-    only ever consults ``run_registry``) to flip, so this arm marks the journal
-    row CANCELLED directly rather than calling ``cancel_run`` (which would
-    unconditionally raise ``KeyError`` here and mask every crash-remnant cancel
-    as a 404).
+    ``getattr(record, "tier", "yaml")`` — because cancellation must be delivered
+    to the process that owns the worker. If absent, the durable journal can still
+    distinguish unknown and terminal runs, but it cannot prove this API process
+    owns a live worker. A RUNNING journal row therefore fails closed with 409;
+    writing CANCELLED without signalling the owner would create a false terminal
+    state while the worker continues to mutate the worktree.
 
     U7 (issue #505, FR-9.1/FR-9.2) note: this is the route the 202 submit body's
     ``links.cancel`` (built by ``_run_links``) points at — the SAME acknowledged
     run id round-trips back here. It is the ONLY cancel handler; U7 adds no new
-    route (NR-1). The registry-miss journal-fallback arm above is what makes a
-    detached async-submitted run, or one whose registry entry was lost to a
-    restart, still cancellable from the journal alone (journal-is-authoritative).
+    route (NR-1). The journal remains authoritative for inspection, but
+    process-local ownership remains authoritative for control delivery.
     """
     from cli_agent_orchestrator.models.workflow_runtime import RunState
     from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
@@ -5274,9 +5270,13 @@ async def cancel_workflow_run_endpoint(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"run '{run_id}' is already {row.state}; cannot cancel",
             )
-        finished_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        workflow_journal.update_run_state(run_id, RunState.CANCELLED.value, finished_at)
-        return {"success": True, "run_id": run_id}
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"run '{run_id}' is recorded as {row.state} but is not live in this "
+                "server; cancellation was not delivered"
+            ),
+        )
 
     if getattr(record, "tier", "yaml") == "script":
         record_state = getattr(record, "state", None)

@@ -1209,12 +1209,16 @@ def get_run_status(run_id: str) -> RunStatus:
                 current_step_id=row.current_step_id,
                 steps=[],
             )
-        # Rebuild from the journal ONCE, then re-populate the cache (§2, B4-BR-4).
+        # Rebuild from the journal ONCE. Terminal records may re-populate the
+        # read cache, but a cold RUNNING record must not enter ``run_registry``:
+        # that registry is also the process-local control-delivery seam. Caching
+        # a foreign/restarted RUNNING row there would let cancel report success
+        # while signalling an undriven reconstruction instead of the real owner.
         # A genuinely-absent run (absent from BOTH cache and journal) raises
         # KeyError -> 404 (F1, contract unchanged). The rebuild returns None on
         # absent and NEVER raises ValueError on this status read path.
         record = _rebuild_record_from_journal(run_id)
-        if record is not None:
+        if record is not None and record.state != RunState.RUNNING:
             run_registry[run_id] = record
     if record is None:
         raise KeyError(f"unknown run_id '{run_id}'")
