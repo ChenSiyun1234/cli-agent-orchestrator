@@ -2577,6 +2577,28 @@ class TestClaudeCodeScreenDetection:
         ]
         assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
 
+    def test_completion_summary_with_railless_bare_prompt_is_completed(self):
+        """A final repaint may erase both composer rails but keep the prompt."""
+        screen = [
+            "● All requested work is complete.",
+            "✻ Churned for 1h 38m 24s · done 9:52 PM",
+            "❯",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+    def test_railless_bare_prompt_without_completion_is_unknown(self):
+        screen = ["ready for input", "❯"]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.UNKNOWN
+
+    def test_railless_completion_with_live_footer_is_not_completed(self):
+        screen = [
+            "● Partial response.",
+            "✻ Pondered for 12s",
+            "❯",
+            "esc to interrupt",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.UNKNOWN
+
     def test_response_bullet_with_gerund_is_not_false_spinner(self):
         """A settled COMPLETED turn whose "*"/"·" response bullet ends in a
         gerund + ellipsis must NOT read as a live spinner. The loose

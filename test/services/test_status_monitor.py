@@ -357,6 +357,30 @@ class TestScreenDetection:
         sm._detect_and_apply_screen("t1", provider)
         assert sm._last_status["t1"] == TerminalStatus.COMPLETED
 
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_railless_final_repaint_settles_cached_processing(self, mock_get_backend, mock_pm):
+        """A quiescent summary plus bare prompt must release PROCESSING."""
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_get_backend.return_value = backend
+        provider = ClaudeCodeProvider("t1", "s", "w")
+        provider._initialized = True
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        final = (
+            "\x1b[H\x1b[2J" "● CURRENT_RESPONSE\r\n" "✻ Churned for 12s · done 9:52 PM\r\n" "❯ \r\n"
+        )
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = final
+        sm._feed_screen_locked("t1", final)
+        sm._bursting["t1"] = False
+
+        assert sm._detect_and_apply_screen("t1", provider) == TerminalStatus.COMPLETED
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
     def test_erased_new_turn_spinner_cannot_reuse_previous_ready_frame(self):
         """A settled spinner erase is not proof that the new turn completed.
 

@@ -1320,6 +1320,28 @@ class ClaudeCodeProvider(BaseProvider):
             any(0 < pi - si <= 2 for si in sep_idx) and any(0 < si - pi <= 2 for si in sep_idx)
             for pi in prompt_idx
         )
+        if not boxed_prompt:
+            # Claude can erase both composer rails on the final repaint while
+            # leaving the completion summary and an exact bare prompt visible.
+            # That settled viewport previously returned UNKNOWN, so a cached
+            # PROCESSING status could remain stuck until an unrelated repaint.
+            # Keep this fallback deliberately narrow: the prompt must be bare
+            # and near the bottom, a non-wait completion summary must precede
+            # it, and no live interrupt footer may follow it.
+            tail_start = max(0, len(rows) - 8)
+            bare_prompt_idx = [
+                i for i in range(tail_start, len(rows)) if re.fullmatch(r"[>❯][\s\xa0]*", rows[i])
+            ]
+            if bare_prompt_idx:
+                pi = bare_prompt_idx[-1]
+                before_prompt = "\n".join(rows[:pi])
+                after_prompt = "\n".join(rows[pi + 1 :]).lower()
+                has_completion = any(
+                    "Waiting" not in match.group(0)
+                    for match in re.finditer(GET_STATUS_COMPLETION_PATTERN, before_prompt)
+                )
+                if has_completion and LIVE_INTERRUPT_FOOTER not in after_prompt:
+                    return TerminalStatus.COMPLETED
         if boxed_prompt:
             # Fragmentation-proof live signal (mirrors get_status): a footer
             # containing "esc to interrupt" STRICTLY AFTER the input box's bottom
